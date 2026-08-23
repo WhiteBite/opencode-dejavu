@@ -28,7 +28,7 @@ dejavu-opencode-plugin/
 
 | Task | Location | Notes |
 |------|----------|-------|
-| Gate enforcement (remind/block/override) | `index.ts` `tool.execute.before` | state machine lives in per-session Maps |
+| Gate enforcement (remind/block/override) | `index.ts` `tool.execute.before` | session state lives ON THE GATE (`remindedSessions`/`failedSessions`), read fresh under the store lock |
 | Failure detection + recording | `index.ts` `tool.execute.after` + `event` | two channels: exit/text vs message stream |
 | Signature/normalization | `src/patterns.ts` | `callSignature`, `normalizeCommand`, `parameterizeError` |
 | Blocking policy | `src/patterns.ts:canBlock()` | single source of truth — bash non-diagnostics, no bare `-c <str>` shapes |
@@ -41,22 +41,23 @@ dejavu-opencode-plugin/
 
 | Symbol | Type | Location | Role |
 |--------|------|----------|------|
-| `Dejavu` | Plugin factory | index.ts:82 | entry point; wires 4 hooks, also `export default` |
-| `GateSignal` | class | index.ts:35 | sentinel error — the ONLY error rethrown from hooks |
-| `callSignature` | fn | src/patterns.ts:257 | stable call identity per tool (bash/read/edit/write/glob/grep) |
-| `patternKey` | fn | src/patterns.ts:285 | sha1 prefix-12 of signature — the gate key |
-| `canBlock` | fn | src/patterns.ts:163 | blocking policy gate |
-| `normalizeCommand` | fn | src/patterns.ts:72 | bash → signature; fingerprints interpreter one-liner payloads |
+| `Dejavu` | Plugin factory | index.ts:66 | entry point; wires 4 hooks, also `export default` |
+| `GateSignal` | class | index.ts:37 | sentinel error — the ONLY error rethrown from hooks |
+| `callSignature` | fn | src/patterns.ts:272 | stable call identity per tool (bash/read/edit/write/glob/grep) |
+| `patternKey` | fn | src/patterns.ts:300 | sha1 prefix-12 of signature — the gate key |
+| `canBlock` | fn | src/patterns.ts:178 | blocking policy gate |
+| `normalizeCommand` | fn | src/patterns.ts:80 | bash → signature; fingerprints interpreter one-liner payloads |
 | `hashInterpreterPayload` | fn | src/patterns.ts:56 | `-c`/`-e` code payload → `<code:hash>` (identity of one-liners) |
-| `detectFailure` | fn | src/patterns.ts:357 | line-by-line bash-output failure scan |
-| `isNoiseError` | fn | src/patterns.ts:383 | aborted/cancelled executions are not failures |
+| `fuzzySimilar` | fn | src/patterns.ts:349 | near-duplicate merge; length-band pre-filter + `FUZZY_MAX_LEN` cap |
+| `detectFailure` | fn | src/patterns.ts:393 | line-by-line bash-output failure scan |
+| `isNoiseError` | fn | src/patterns.ts:419 | aborted/cancelled executions are not failures |
 | `scrubSecrets` | fn | src/patterns.ts:36 | redaction before ANY persistence |
-| `GateStore` | class | src/store.ts:175 | one scope: gates.json + index.json + log.jsonl, mtime caches, reconcile |
-| `Stores` | class | src/store.ts:452 | two-scope manager: findGate/recordFailure/migrate/expire/reconcileAll |
-| `mergeGate` | fn | src/store.ts:422 | evidence merge for dedupe/escalation (never demotes blocking) |
-| `coerceGateShape` | fn | src/validate.ts:20 | strict parse of a persisted gate record (hopeless → null) |
-| `repairGate` | fn | src/validate.ts:61 | mechanical repair: inverted dates, truncation, re-scrub, demote |
-| `atomicWrite` / `withLock` | fn | src/store.ts:106/137 | Windows-safe fs primitives |
+| `GateStore` | class | src/store.ts:190 | one scope: gates.json + index.json + log.jsonl, TTL caches, key index |
+| `Stores` | class | src/store.ts:513 | two-scope manager: findGate/recordFailure/migrate/expire/reconcileAll/forgetSession |
+| `mergeGate` | fn | src/store.ts:483 | evidence merge for dedupe/escalation (never demotes blocking) |
+| `coerceGateShape` | fn | src/validate.ts:24 | strict parse of a persisted gate record (hopeless → null) |
+| `repairGate` | fn | src/validate.ts:76 | mechanical repair: inverted dates, truncation, re-scrub, demote, session-state hygiene |
+| `atomicWrite` / `withLock` | fn | src/store.ts:120/151 | Windows-safe fs primitives |
 
 ## CONVENTIONS
 
@@ -84,6 +85,7 @@ dejavu-opencode-plugin/
 
 - Two-scope store: project gates in `<repo>/.opencode/dejavu/` (committable) escalate to global `~/.config/opencode/dejavu/` after appearing in 2+ project dirs (agent habits vs repo quirks)
 - Self-healing stores: every init runs `reconcileAll()` — unparseable files are quarantined (bytes preserved in `*.corrupt-*`, never deleted), records are strictly parsed + mechanically repaired, index is reconciled, and every repair is logged (`repaired`/`quarantined` events); `doctor --repair` does the same on demand — one command replaces hand-debugging
+- Multi-window safe: the remind→block chain is persisted on the gate, not in process memory — several OpenCode windows (each its own process on the shared store) and process restarts all see the same escalation; hot-path reads use a 1s TTL cache + O(1) key index
 - `dejavu:proceed` escape hatch: trailing marker comment, matched with word boundaries, stripped before normalization so bypassed failures land on the original pattern
 - `recurredAfterGate` is THE health metric — gates that fire without killing the error get `review: true`
 - Windows-first fs: `\\?\` long-path prefix, tmp+rename with EPERM/EACCES/EBUSY backoff, lockfile with stale-steal and 3s degrade-to-unlocked (never hang the tool pipeline)

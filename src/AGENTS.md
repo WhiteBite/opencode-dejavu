@@ -32,7 +32,8 @@ Two dependency-free modules: `patterns.ts` (pure functions — call identity, no
 - Cross-project evidence lives ONLY in the global `index.json` — a gate's own `projects` array sees one store and never drives escalation alone
 - Escalation writes the global gate FIRST, then removes the project copy — a crash between the two writes must leave a duplicate (healed by migrate), never a hole
 - Inside `runLocked` always `load(true)`; unlocked `load()` peeks are routing hints only, never a basis for mutation
-- `GateStore.load` caches by mtime — after external edits the cache refreshes on next stat; `save()` refreshes it manually
+- Hot-path reads use the 1s TTL cache + key index (`byKey`/`blockingOnly`); mutations inside locks use `load(true)`; `save()` refreshes the cache directly
+- The remind→block chain is persisted ON THE GATE (`remindedSessions`/`failedSessions`) and enforced under the store lock — process memory holds nothing authoritative, so several windows and restarts share one escalation
 - Log appends and rotation take the log lock — every OpenCode window shares the global log; unlocked appends interleave into broken JSON
 - Every gate read from disk crosses `coerceGateShape` + `repairGate` in `load()` — enforcement never sees raw state; hopeless records are dropped, repairable ones coerced
 - Quarantine preserves bytes: unparseable files are renamed to `*.corrupt-*`, never deleted; every repair emits a `repaired`/`quarantined` log event

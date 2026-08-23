@@ -23,10 +23,6 @@ const TTL_DAYS = 60
 const TTL_INTERVAL_MS = 6 * 60 * 60 * 1000
 /** a gate firing this often without killing the error gets flagged for review */
 const REVIEW_FIRES = 10
-/** per-session state maps are capped to bound memory in long-lived processes */
-const SESSION_MAP_CAP = 200
-/** per-session key sets are capped too — one long session must not grow unbounded */
-const SESSION_KEY_CAP = 500
 /** a "retry" arriving this soon after a reminder was dispatched concurrently with it
  * (same tool-call burst) and never saw the reminder — it gets reminded as well.
  * A true agent retry needs a full model turn (≥1s in practice), so 500ms separates both. */
@@ -39,29 +35,6 @@ const PENDING_CAP = 1000
 
 /** Sentinel: intentional gate/reminder throws (rethrown); our own bugs are swallowed. */
 class GateSignal extends Error {}
-
-function addToSetMap(map: Map<string, Set<string>>, outer: string, inner: string): void {
-  let set = map.get(outer)
-  if (!set) {
-    set = new Set()
-    map.set(outer, set)
-  }
-  set.add(inner)
-  while (set.size > SESSION_KEY_CAP) {
-    const oldest = set.values().next()
-    if (oldest.done) break
-    set.delete(oldest.value)
-  }
-}
-
-/** Drop oldest entries (Map preserves insertion order) to bound memory. */
-function capMap<K, V>(map: Map<K, V>, cap: number): void {
-  while (map.size > cap) {
-    const oldest = map.keys().next()
-    if (oldest.done) break
-    map.delete(oldest.value)
-  }
-}
 
 function scrubbedArgs(args: Record<string, unknown>): Record<string, unknown> {
   if (typeof args.command === "string") return { ...args, command: scrubSecrets(args.command) }
@@ -100,10 +73,6 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
       : null
   const stores = new Stores(globalStore, projectStore)
 
-  /** sessions in which a gate key was already reminded about; value = remind time (race guard) */
-  const reminded = new Map<string, Map<string, number>>()
-  /** sessions in which a reminded pattern failed again — next attempt is blocked */
-  const failedAfterReminder = new Map<string, Set<string>>()
   /** callID -> signature fallback when the after-hook does not receive args */
   const pendingCalls = new Map<string, string>()
   /** message part IDs already counted as tool-level errors */
@@ -197,35 +166,45 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
           return
         }
 
-        // Repeat offense: reminded in this session, retried, failed again -> hard block.
-        if (failedAfterReminder.get(session)?.has(gate.key)) {
-          gate.blockedCount += 1
-          if (gate.blockedCount >= REVIEW_FIRES) gate.review = true
-          await found.store.save()
-          await stores.logAll({ type: "blocked", key: gate.key, tool: gate.tool, session, project: directory, via })
-          throw new GateSignal(blockMessage(gate, found.store.dir))
-        }
+        // Enforce from FRESH gate state under the store lock. The remind→block
+        // chain lives on the gate itself (remindedSessions/failedSessions), so
+        // it survives process restarts and is visible to every window serving
+        // this session — per-process maps lost it on both.
+        const target = found
+        let signal: GateSignal | null = null
+        await target.store.runLocked(async () => {
+          const fresh = (await target.store.load(true)).find((g) => g.key === gate.key)
+          if (fresh === undefined) return // gate deleted between find and lock
 
-        // First encounter this session -> remind (the call is aborted; agent may retry corrected).
-        // Race guard: calls dispatched in the same burst all arrive before the agent can
-        // have seen any reminder, so a "retry" within REMINDER_RACE_WINDOW_MS of the
-        // remind is itself a concurrent first encounter and gets reminded too.
-        const sessionReminded = reminded.get(session) ?? new Map<string, number>()
-        if (!reminded.has(session)) reminded.set(session, sessionReminded)
-        const remindedAt = sessionReminded.get(gate.key)
-        if (remindedAt === undefined || Date.now() - remindedAt < REMINDER_RACE_WINDOW_MS) {
-          sessionReminded.set(gate.key, Date.now())
-          sessionReminded.set(patternKey(signature), Date.now()) // exact key too: retry may fuzzy-match differently
-          capMap(sessionReminded, SESSION_KEY_CAP)
-          capMap(reminded, SESSION_MAP_CAP)
-          gate.remindedCount += 1
-          await found.store.save()
-          await stores.logAll({ type: "reminded", key: gate.key, tool: gate.tool, session, project: directory, via })
-          throw new GateSignal(remindMessage(gate))
-        }
+          // Repeat offense: reminded, retried, failed again -> hard block.
+          if (fresh.failedSessions !== undefined && fresh.failedSessions.includes(session)) {
+            fresh.blockedCount += 1
+            if (fresh.blockedCount >= REVIEW_FIRES) fresh.review = true
+            await target.store.save()
+            await stores.logAll({ type: "blocked", key: fresh.key, tool: fresh.tool, session, project: directory, via })
+            signal = new GateSignal(blockMessage(fresh, target.store.dir))
+            return
+          }
 
-        // Already reminded, no repeated failure yet -> allow one retry.
-        await stores.logAll({ type: "retry-allowed", key: gate.key, tool: gate.tool, session, project: directory, via })
+          // First encounter this session -> remind (the call is aborted; agent may retry corrected).
+          // Race guard: calls dispatched in the same burst all arrive before the agent can
+          // have seen any reminder, so a "retry" within REMINDER_RACE_WINDOW_MS of the
+          // remind is itself a concurrent first encounter and gets reminded too.
+          const remindedAt = fresh.remindedSessions?.[session]
+          if (remindedAt === undefined || Date.now() - remindedAt < REMINDER_RACE_WINDOW_MS) {
+            if (fresh.remindedSessions === undefined) fresh.remindedSessions = {}
+            fresh.remindedSessions[session] = Date.now()
+            fresh.remindedCount += 1
+            await target.store.save()
+            await stores.logAll({ type: "reminded", key: fresh.key, tool: fresh.tool, session, project: directory, via })
+            signal = new GateSignal(remindMessage(fresh))
+            return
+          }
+
+          // Already reminded, no repeated failure yet -> allow one retry.
+          await stores.logAll({ type: "retry-allowed", key: fresh.key, tool: fresh.tool, session, project: directory, via })
+        })
+        if (signal !== null) throw signal
       } catch (error) {
         if (error instanceof GateSignal) throw error
         // Our own bugs must never break the user's tool calls.
@@ -309,21 +288,29 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
           await logClient("info", `dejavu: gate went global — "${result.gate.signature}"`)
         }
 
-        // Metric: failure of an already-enforced pattern (the event that
-        // promoted the gate does not count — the gate did not exist yet).
-        if (result.gate.status === "blocking" && !result.promoted) {
-          result.gate.recurredAfterGate += 1
-          await result.store.save()
-          await stores.logAll({ type: "recurred-after-gate", key, tool: input.tool, session, project: directory })
-        }
-
-        // Same-session repeat after a reminder -> escalate to hard block.
-        if (reminded.get(session)?.has(key) || reminded.get(session)?.has(result.gate.key)) {
-          addToSetMap(failedAfterReminder, session, result.gate.key)
-          capMap(failedAfterReminder, SESSION_MAP_CAP)
-          result.gate.recurredAfterReminder += 1
-          await result.store.save()
-        }
+        // Persist escalation state on the gate itself (under the store lock) so
+        // every window serving this session sees the same remind→block chain.
+        const ownerStore = result.wentGlobal ? stores.globalStore : result.store
+        await ownerStore.runLocked(async () => {
+          const fresh = (await ownerStore.load(true)).find((g) => g.key === result.gate.key)
+          if (fresh === undefined) return
+          let changed = false
+          // Metric: failure of an already-enforced pattern (the event that
+          // promoted the gate does not count — the gate did not exist yet).
+          if (fresh.status === "blocking" && !result.promoted) {
+            fresh.recurredAfterGate += 1
+            changed = true
+            await stores.logAll({ type: "recurred-after-gate", key: fresh.key, tool: input.tool, session, project: directory })
+          }
+          // Same-session repeat after a reminder -> escalate to hard block.
+          if (fresh.remindedSessions?.[session] !== undefined) {
+            if (fresh.failedSessions === undefined) fresh.failedSessions = []
+            if (!fresh.failedSessions.includes(session)) fresh.failedSessions.push(session)
+            fresh.recurredAfterReminder += 1
+            changed = true
+          }
+          if (changed) await ownerStore.save()
+        })
       } catch {
         // detection failures must never break the tool pipeline
       }
@@ -333,12 +320,11 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
       try {
         const type = (event as { type?: unknown }).type
 
-        // Free per-session state when a session is deleted.
+        // Free the persisted per-session state when a session is deleted.
         if (type === "session.deleted") {
           const props = (event as { properties?: unknown }).properties as { sessionID?: unknown } | undefined
           if (typeof props?.sessionID === "string") {
-            reminded.delete(props.sessionID)
-            failedAfterReminder.delete(props.sessionID)
+            stores.forgetSession(props.sessionID).catch(() => {})
           }
           return
         }

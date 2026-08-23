@@ -36,6 +36,7 @@ interface Scope {
   records: unknown[]
   rawState: "missing" | "unparseable" | "ok"
   corruptLogLines: number
+  degradedEvents: number
 }
 
 async function loadScope(dir: string, isGlobal: boolean): Promise<Scope> {
@@ -56,10 +57,12 @@ async function loadScope(dir: string, isGlobal: boolean): Promise<Scope> {
     rawState = "missing"
   }
   let corruptLogLines = 0
+  let degradedEvents = 0
   try {
     const raw = await readFile(join(dir, "log.jsonl"), "utf8")
     for (const line of raw.split("\n")) {
       if (line.trim() === "") continue
+      if (line.includes('"type":"degraded"')) degradedEvents++
       try {
         JSON.parse(line)
       } catch {
@@ -70,7 +73,7 @@ async function loadScope(dir: string, isGlobal: boolean): Promise<Scope> {
     // no log yet
   }
   const store = new GateStore(dir)
-  return { dir, isGlobal, gates: await store.load(), records, rawState, corruptLogLines }
+  return { dir, isGlobal, gates: await store.load(), records, rawState, corruptLogLines, degradedEvents }
 }
 
 const scopes: Scope[] = [await loadScope(globalDir, true)]
@@ -173,6 +176,13 @@ for (const scope of scopes) {
   if (scope.corruptLogLines > 0) {
     issues++
     console.log(`   CORRUPT LOG LINES (${scope.corruptLogLines}) — doctor --repair excises them to log.jsonl.corrupt`)
+  }
+
+  if (scope.degradedEvents > 0) {
+    // Observability, not a defect: the degrade-to-unlocked design trades rare
+    // lost updates for never hanging the tool pipeline. Watch the trend — a
+    // growing count is the signal to revisit the storage backend.
+    console.log(`   note: LOCK DEGRADATIONS (${scope.degradedEvents}) — contention exceeded the wait window; updates may have been lost there`)
   }
 
   try {

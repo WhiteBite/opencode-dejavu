@@ -1,10 +1,10 @@
 import { appendFile, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
-import { canBlock, fuzzySimilar, scrubSecrets } from "./patterns"
+import { canBlock, fuzzySimilar, FUZZY_MAX_LEN, scrubSecrets } from "./patterns"
 import { coerceGateShape, repairGate } from "./validate"
 
 /** Bumped on behavior changes; stamped into init log events so stale sessions are visible. */
-export const PLUGIN_VERSION = "2.2.1"
+export const PLUGIN_VERSION = "2.3.0"
 
 export interface Gate {
   /** sha1 signature prefix — the pattern identity */
@@ -32,6 +32,12 @@ export interface Gate {
   recurredAfterGate: number
   /** flagged for manual review when the gate fires often but errors stopped */
   review?: boolean
+  /** sessions currently reminded about this gate: sessionID -> remind time (ms).
+   * Persisted on the gate so the remind→block chain survives process restarts
+   * and is visible to every window serving the session. */
+  remindedSessions?: Record<string, number>
+  /** sessions that failed again after a reminder — their next attempt blocks */
+  failedSessions?: string[]
 }
 
 interface GatesFile {
@@ -84,8 +90,12 @@ export interface LogEvent {
 const MAX_SESSIONS = 50
 const MAX_PROJECTS = 20
 const LOG_ROTATE_BYTES = 512 * 1024
+/** the global log aggregates every project — rotate it later or forensics vanish in a day */
+const GLOBAL_LOG_ROTATE_BYTES = 2048 * 1024
 const LOG_ROTATE_KEEP_LINES = 1000
 const DAY_MS = 24 * 60 * 60 * 1000
+/** trust the loaded-gates cache this long without re-statting (hot path: every tool call) */
+const LOAD_CACHE_TTL_MS = 1000
 
 /** failures required before a pattern becomes an enforced gate */
 export const PROMOTE_COUNT = 3
@@ -180,6 +190,10 @@ async function withLock<T>(lockTarget: string, fn: () => Promise<T>, onDegrade?:
 export class GateStore {
   private gates: Gate[] | null = null
   private mtimeMs = 0
+  /** hot-path caches: valid until LOAD_CACHE_TTL_MS / invalidated on mutation */
+  private cacheUntilMs = 0
+  private keyIndex: Map<string, Gate> | null = null
+  private blockingCache: Gate[] | null = null
   private index: IndexFile | null = null
   private indexMtimeMs = 0
 
@@ -210,9 +224,16 @@ export class GateStore {
    * dropped, repairable ones coerced — enforcement never sees raw state.
    */
   async load(force = false): Promise<Gate[]> {
+    // TTL fast path: the hot path (every tool call) must not pay a stat per
+    // call. Gates change rarely (promotion, manual edit); 1s staleness is
+    // invisible to enforcement and our own saves refresh the cache directly.
+    if (!force && this.gates !== null && Date.now() < this.cacheUntilMs) {
+      return this.gates
+    }
     try {
       const info = await stat(ntPath(this.gatesPath))
       if (!force && this.gates !== null && info.mtimeMs === this.mtimeMs) {
+        this.cacheUntilMs = Date.now() + LOAD_CACHE_TTL_MS
         return this.gates
       }
       const raw = await readFile(ntPath(this.gatesPath), "utf8")
@@ -226,13 +247,37 @@ export class GateStore {
         gates.push(gate)
       }
       this.gates = gates
+      this.keyIndex = new Map(gates.map((g) => [g.key, g]))
+      this.blockingCache = gates.filter((g) => g.status === "blocking")
       this.mtimeMs = info.mtimeMs
+      this.cacheUntilMs = Date.now() + LOAD_CACHE_TTL_MS
       return this.gates
     } catch {
       // missing or unreadable gates.json — treat as an empty store
-      if (this.gates === null) this.gates = []
+      if (this.gates === null) {
+        this.gates = []
+        this.keyIndex = new Map()
+        this.blockingCache = []
+      }
+      this.cacheUntilMs = Date.now() + LOAD_CACHE_TTL_MS
       return this.gates
     }
+  }
+
+  /** O(1) exact lookup over the cached gates (call load() first to refresh). */
+  byKey(key: string): Gate | undefined {
+    if (this.keyIndex === null) {
+      this.keyIndex = new Map((this.gates ?? []).map((g) => [g.key, g]))
+    }
+    return this.keyIndex.get(key)
+  }
+
+  /** Cached blocking subset — the fuzzy scan iterates this, not all gates. */
+  blockingOnly(): Gate[] {
+    if (this.blockingCache === null) {
+      this.blockingCache = (this.gates ?? []).filter((g) => g.status === "blocking")
+    }
+    return this.blockingCache
   }
 
   async save(): Promise<void> {
@@ -245,6 +290,9 @@ export class GateStore {
     } catch {
       // mtime refresh is best-effort
     }
+    // We know the content we just wrote — refresh the TTL cache directly.
+    // (keyIndex/blockingCache hold references into this.gates, still valid.)
+    this.cacheUntilMs = Date.now() + LOAD_CACHE_TTL_MS
   }
 
   /** Cross-project pattern index; meaningful only on the global store. */
@@ -312,15 +360,19 @@ export class GateStore {
   extract(keys: Set<string>): Gate[] {
     if (this.gates === null) return []
     const removed = this.gates.filter((g) => keys.has(g.key))
-    if (removed.length > 0) this.gates = this.gates.filter((g) => !keys.has(g.key))
+    if (removed.length > 0) {
+      this.gates = this.gates.filter((g) => !keys.has(g.key))
+      this.keyIndex = null
+      this.blockingCache = null
+    }
     return removed
   }
 
-  async rotateLog(): Promise<void> {
+  async rotateLog(rotateBytes: number = LOG_ROTATE_BYTES): Promise<void> {
     await withLock(this.logPath, async () => {
       try {
         const info = await stat(ntPath(this.logPath))
-        if (info.size < LOG_ROTATE_BYTES) return
+        if (info.size < rotateBytes) return
         const raw = await readFile(ntPath(this.logPath), "utf8")
         const lines = raw.split("\n").filter((l) => l.trim() !== "")
         const kept = lines.slice(-LOG_ROTATE_KEEP_LINES)
@@ -471,7 +523,8 @@ export class Stores {
   /** True if a pattern with this key exists in any scope (chain attribution). */
   async hasKey(key: string): Promise<boolean> {
     for (const store of this.scopes()) {
-      if ((await store.load()).some((g) => g.key === key)) return true
+      await store.load()
+      if (store.byKey(key) !== undefined) return true
     }
     return false
   }
@@ -482,13 +535,15 @@ export class Stores {
     signature: string,
   ): Promise<{ gate: Gate; store: GateStore; via: "exact" | "fuzzy" } | null> {
     for (const store of this.scopes()) {
-      const exact = (await store.load()).find((g) => g.key === key)
+      await store.load()
+      const exact = store.byKey(key)
       if (exact) return { gate: exact, store, via: "exact" }
     }
+    // Over-long signatures match exactly only — see FUZZY_MAX_LEN.
+    if (signature.length > FUZZY_MAX_LEN) return null
     let best: { gate: Gate; store: GateStore; score: number } | null = null
     for (const store of this.scopes()) {
-      for (const gate of await store.load()) {
-        if (gate.status !== "blocking") continue
+      for (const gate of store.blockingOnly()) {
         if (!fuzzySimilar(signature, gate.signature)) continue
         const score = Math.abs(signature.length - gate.signature.length)
         if (best === null || score < best.score) best = { gate, store, score }
@@ -501,9 +556,8 @@ export class Stores {
   async blockingGates(): Promise<Gate[]> {
     const result: Gate[] = []
     for (const store of this.scopes()) {
-      for (const gate of await store.load()) {
-        if (gate.status === "blocking") result.push(gate)
-      }
+      await store.load()
+      for (const gate of store.blockingOnly()) result.push(gate)
     }
     return result.sort((a, b) => b.count - a.count)
   }
@@ -541,7 +595,31 @@ export class Stores {
 
   async rotateLogs(): Promise<void> {
     for (const store of this.scopes()) {
-      await store.rotateLog()
+      // The global log aggregates every project — give it more room.
+      await store.rotateLog(store === this.globalStore ? GLOBAL_LOG_ROTATE_BYTES : LOG_ROTATE_BYTES)
+    }
+  }
+
+  /** Forget per-session enforcement state when a session dies. */
+  async forgetSession(sessionID: string): Promise<void> {
+    for (const store of this.scopes()) {
+      await store.runLocked(async () => {
+        const gates = await store.load(true)
+        let changed = false
+        for (const gate of gates) {
+          if (gate.remindedSessions && gate.remindedSessions[sessionID] !== undefined) {
+            delete gate.remindedSessions[sessionID]
+            if (Object.keys(gate.remindedSessions).length === 0) delete gate.remindedSessions
+            changed = true
+          }
+          if (gate.failedSessions !== undefined && gate.failedSessions.includes(sessionID)) {
+            gate.failedSessions = gate.failedSessions.filter((s) => s !== sessionID)
+            if (gate.failedSessions.length === 0) delete gate.failedSessions
+            changed = true
+          }
+        }
+        if (changed) await store.save()
+      })
     }
   }
 
@@ -667,7 +745,11 @@ export class Stores {
       const index = await this.globalStore.loadIndex(true)
       let pruned = 0
       for (const key of Object.keys(index.keys)) {
-        if (!knownKeys.has(key)) {
+        const entry = index.keys[key]
+        // Young entries may belong to a promotion in flight in another window
+        // (its gates were snapshotted after this key was written) — only prune
+        // orphans that have been stale for a day.
+        if (entry && !knownKeys.has(key) && Date.now() - Date.parse(entry.lastSeen) > DAY_MS) {
           delete index.keys[key]
           pruned += 1
         }

@@ -332,6 +332,11 @@ export function levenshtein(a: string, b: string): number {
 /** Code fingerprints are IDENTITY, not data — they must match exactly. */
 const CODE_FINGERPRINTS = /<code:[0-9a-f]+>/g
 
+/** Signatures longer than this match exactly only: a 300-char normalized
+ * command is already specific enough that "30% near" is meaningless, and
+ * Levenshtein on long signatures is the hot-path cost cliff. */
+export const FUZZY_MAX_LEN = 300
+
 /**
  * Near-duplicate match: normalized edit distance <= 30% AND absolute distance
  * >= 3. Unlike token-set Jaccard, this does not collapse commands that merely
@@ -350,6 +355,11 @@ export function fuzzySimilar(a: string, b: string): boolean {
   }
   const maxLen = Math.max(a.length, b.length)
   if (maxLen === 0) return true
+  if (maxLen > FUZZY_MAX_LEN) return false
+  // Triangle inequality: distance >= |lenA - lenB|. If even that floor
+  // exceeds the ratio threshold, no Levenshtein result can pass — an O(1)
+  // pre-filter with zero false negatives that skips most DP computations.
+  if (Math.abs(a.length - b.length) / maxLen > 0.3) return false
   const distance = levenshtein(a, b)
   return distance >= 3 && distance / maxLen <= 0.3
 }

@@ -1,5 +1,23 @@
 # Changelog
 
+## 2.3.0 — 2026-08-24
+
+### Multi-process hardening (several OpenCode windows = several plugin processes on one store)
+- Remind→block session state is persisted ON THE GATE (`remindedSessions`/`failedSessions`) instead of per-process memory: the escalation chain now survives process restarts and is visible to every window serving the session (before: two windows or a restart reset it to "remind forever, never block"). Enforcement reads fresh gate state under the store lock.
+- Session state rots after 24h and is capped per gate; `session.deleted` cleans it from disk.
+
+### Performance (hot path runs on every tool call)
+- `fuzzySimilar`: O(1) length-band pre-filter (triangle inequality — zero false negatives) and a `FUZZY_MAX_LEN` cap — kills the Levenshtein explosion on long signatures (was 150-600ms/tool-call at scale).
+- `GateStore`: O(1) key index + cached blocking subset for lookups; 1s TTL on the mtime cache so the hot path stops paying a `stat` per call (saves refresh the cache directly).
+- Global log rotates at 2MB instead of 512KB — with several projects the aggregate forensics no longer vanish within a day.
+
+### Fixed
+- Init-storm TOCTOU: index orphan-pruning now keeps a 24h grace window, so a just-promoted gate's index entry cannot be pruned by a concurrent startup.
+- After-hook escalation state is written under the store lock and follows the gate to the global store on escalation (previously lost in both cases).
+
+### Added
+- `doctor.ts` reports LOCK DEGRADATIONS (count of `degraded` log events) as an observability note — the evidence signal for whether the storage backend ever needs revisiting.
+
 ## 2.2.1 — 2026-08-24
 
 ### Fixed (adversarial-review round)

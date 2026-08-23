@@ -11,6 +11,10 @@ import { canBlock, scrubSecrets } from "./patterns"
 const KEY_SHAPE = /^[0-9a-f]{12}$/
 /** detection truncates snippets at 200 chars on ingest */
 const SNIPPET_MAX = 200
+/** per-session enforcement state rots after a day — sessions do not live longer */
+const SESSION_STATE_TTL_MS = 24 * 60 * 60 * 1000
+/** bound per-gate session state so long-lived gates cannot bloat */
+const SESSION_STATE_CAP = 50
 
 /**
  * Structural parse of one persisted gate object. Returns a well-shaped Gate
@@ -50,6 +54,17 @@ export function coerceGateShape(raw: unknown): Gate | null {
   }
   if (typeof r.correction === "string") gate.correction = r.correction
   if (r.review === true) gate.review = true
+  if (r.remindedSessions !== null && typeof r.remindedSessions === "object" && !Array.isArray(r.remindedSessions)) {
+    const sessions: Record<string, number> = {}
+    for (const [session, at] of Object.entries(r.remindedSessions as Record<string, unknown>)) {
+      if (typeof at === "number" && Number.isFinite(at)) sessions[session] = at
+    }
+    if (Object.keys(sessions).length > 0) gate.remindedSessions = sessions
+  }
+  if (Array.isArray(r.failedSessions)) {
+    const sessions = r.failedSessions.filter((x): x is string => typeof x === "string")
+    if (sessions.length > 0) gate.failedSessions = sessions
+  }
   return gate
 }
 
@@ -86,6 +101,33 @@ export function repairGate(gate: Gate): boolean {
       gate.correction = correction
       changed = true
     }
+  }
+  // Per-session enforcement state hygiene: rot stale entries, bound the rest.
+  if (gate.remindedSessions !== undefined) {
+    const now = Date.now()
+    const reminded = gate.remindedSessions
+    for (const session of Object.keys(reminded)) {
+      if (now - (reminded[session] ?? 0) > SESSION_STATE_TTL_MS) {
+        delete reminded[session]
+        changed = true
+      }
+    }
+    const sessions = Object.keys(reminded)
+    if (sessions.length > SESSION_STATE_CAP) {
+      sessions.sort((a, b) => (reminded[a] ?? 0) - (reminded[b] ?? 0))
+      for (const session of sessions.slice(0, sessions.length - SESSION_STATE_CAP)) {
+        delete reminded[session]
+      }
+      changed = true
+    }
+    if (Object.keys(reminded).length === 0) delete gate.remindedSessions
+  }
+  if (gate.failedSessions !== undefined) {
+    if (gate.failedSessions.length > SESSION_STATE_CAP) {
+      gate.failedSessions = gate.failedSessions.slice(-SESSION_STATE_CAP)
+      changed = true
+    }
+    if (gate.failedSessions.length === 0) delete gate.failedSessions
   }
   // Policy is the single source of truth: a blocking gate that cannot block
   // is a leftover from an older policy and must be demoted.

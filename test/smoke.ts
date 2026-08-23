@@ -518,7 +518,7 @@ await writeFile(
   JSON.stringify({
     version: 1,
     keys: {
-      ffff00000001: { projects: ["nowhere"], lastSeen: "2026-08-23T00:00:00.000Z" },
+      ffff00000001: { projects: ["nowhere"], lastSeen: "2026-08-20T00:00:00.000Z" },
       eeee00000001: { projects: ["projA", "projB"], lastSeen: "2026-08-23T00:00:00.000Z" },
     },
   }),
@@ -540,6 +540,55 @@ check("missing index entry rebuilt from the global gate", idxAfter.keys["dddd000
 check(
   "gate proven in 2+ projects escalates to global on reconcile",
   idxGlobalGates.some((g) => g.key === "eeee00000001") && !idxProjectGates.some((g) => g.key === "eeee00000001"),
+)
+
+// --- 26. multi-window: session state lives on the gate, not in a process ---
+const winDir = join(tmp, "win-project")
+const hooksW1 = await Dejavu({ directory: winDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+const hooksW2 = await Dejavu({ directory: winDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+const w1Before = hooksW1["tool.execute.before"] as BeforeHook
+const w2Before = hooksW2["tool.execute.before"] as BeforeHook
+const w1After = hooksW1["tool.execute.after"] as AfterHook
+const w2After = hooksW2["tool.execute.after"] as AfterHook
+const WIN_CMD = "deploy --to prod"
+const winFail = async (hook: AfterHook, session: string, callID: string): Promise<void> => {
+  await hook(
+    { tool: "bash", sessionID: session, callID, args: { command: WIN_CMD } } as unknown as AfterInput,
+    { title: WIN_CMD, output: "npm ERR! boom\nExit code: 1", metadata: {} } as unknown as AfterOutput,
+  )
+}
+await winFail(w1After, "wa", "p1")
+await winFail(w1After, "wa", "p2")
+await winFail(w1After, "wb", "p3")
+check(
+  "gate promoted for multi-window test",
+  (await readJson(join(winDir, ".opencode", "dejavu", "gates.json"))).some((g) => g.signature === `bash:${WIN_CMD}` && g.status === "blocking"),
+)
+const attemptOn = (hook: BeforeHook) => async (session: string, callID: string): Promise<Error | null> => {
+  try {
+    await hook({ tool: "bash", sessionID: session, callID } as unknown as BeforeInput, { args: { command: WIN_CMD } } as unknown as BeforeOutput)
+    return null
+  } catch (error) {
+    return error as Error
+  }
+}
+const remindW1 = await attemptOn(w1Before)("shared-ses", "p4")
+check("window 1 reminds on first encounter", remindW1 !== null && remindW1.message.includes("[dejavu] REMINDER"))
+await new Promise((resolve) => setTimeout(resolve, 1100)) // session moves to window 2: past the TTL and the race window
+const seenByW2 = await attemptOn(w2Before)("shared-ses", "p5")
+check("window 2 sees window 1's reminder (state is on the gate, not in the process)", seenByW2 === null)
+await winFail(w2After, "shared-ses", "p6")
+const blockedW1 = await attemptOn(w1Before)("shared-ses", "p7")
+check("block escalates across processes", blockedW1 !== null && blockedW1.message.includes("[dejavu] BLOCKED"))
+
+// --- 27. fuzzy pre-filters: length band + over-long cap ---
+check(
+  "length-band pre-filter rejects impossible fuzzy matches",
+  !fuzzySimilar("bash:git push <str>", "bash:completely different and much longer command shape here"),
+)
+check(
+  "over-long signatures never fuzzy-match (exact only)",
+  !fuzzySimilar(`bash:${"x".repeat(320)}`, `bash:${"x".repeat(320)} tail`),
 )
 
 await rm(tmp, { recursive: true, force: true })
