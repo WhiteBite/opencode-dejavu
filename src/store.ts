@@ -1,9 +1,10 @@
 import { appendFile, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
 import { canBlock, fuzzySimilar, scrubSecrets } from "./patterns"
+import { coerceGateShape, repairGate } from "./validate"
 
 /** Bumped on behavior changes; stamped into init log events so stale sessions are visible. */
-export const PLUGIN_VERSION = "2.1.0"
+export const PLUGIN_VERSION = "2.2.0"
 
 export interface Gate {
   /** sha1 signature prefix — the pattern identity */
@@ -38,6 +39,17 @@ interface GatesFile {
   gates: Gate[]
 }
 
+/** Cross-project pattern index: which project dirs have seen each key. */
+interface IndexEntry {
+  projects: string[]
+  lastSeen: string
+}
+
+interface IndexFile {
+  version: 1
+  keys: Record<string, IndexEntry>
+}
+
 export type LogEventType =
   | "detected"
   | "promoted"
@@ -48,6 +60,8 @@ export type LogEventType =
   | "expired"
   | "recurred-after-gate"
   | "init"
+  | "repaired"
+  | "quarantined"
 
 export interface LogEvent {
   type: LogEventType
@@ -161,6 +175,8 @@ async function withLock<T>(lockTarget: string, fn: () => Promise<T>): Promise<T>
 export class GateStore {
   private gates: Gate[] | null = null
   private mtimeMs = 0
+  private index: IndexFile | null = null
+  private indexMtimeMs = 0
 
   constructor(public readonly dir: string) {}
 
@@ -172,12 +188,20 @@ export class GateStore {
     return join(this.dir, "log.jsonl")
   }
 
+  private get indexPath(): string {
+    return join(this.dir, "index.json")
+  }
+
   /** Run a load→mutate→save section under the store's exclusive lock. */
   async runLocked<T>(fn: () => Promise<T>): Promise<T> {
     return withLock(this.gatesPath, fn)
   }
 
-  /** force=true bypasses the mtime cache (always used inside locks). */
+  /**
+   * force=true bypasses the mtime cache (always used inside locks).
+   * Every record crosses the validation boundary: hopeless records are
+   * dropped, repairable ones coerced — enforcement never sees raw state.
+   */
   async load(force = false): Promise<Gate[]> {
     try {
       const info = await stat(ntPath(this.gatesPath))
@@ -186,7 +210,15 @@ export class GateStore {
       }
       const raw = await readFile(ntPath(this.gatesPath), "utf8")
       const parsed = JSON.parse(raw) as Partial<GatesFile>
-      this.gates = Array.isArray(parsed.gates) ? parsed.gates : []
+      const records = Array.isArray(parsed.gates) ? parsed.gates : []
+      const gates: Gate[] = []
+      for (const record of records) {
+        const gate = coerceGateShape(record)
+        if (gate === null) continue
+        repairGate(gate)
+        gates.push(gate)
+      }
+      this.gates = gates
       this.mtimeMs = info.mtimeMs
       return this.gates
     } catch {
@@ -208,10 +240,52 @@ export class GateStore {
     }
   }
 
-  async log(event: LogEvent): Promise<void> {
+  /** Cross-project pattern index; meaningful only on the global store. */
+  async loadIndex(force = false): Promise<IndexFile> {
+    try {
+      const info = await stat(ntPath(this.indexPath))
+      if (!force && this.index !== null && info.mtimeMs === this.indexMtimeMs) {
+        return this.index
+      }
+      const raw = await readFile(ntPath(this.indexPath), "utf8")
+      const parsed = JSON.parse(raw) as Partial<IndexFile>
+      const keys = parsed.keys
+      this.index = { version: 1, keys: keys !== null && typeof keys === "object" ? keys : {} }
+      this.indexMtimeMs = info.mtimeMs
+      return this.index
+    } catch {
+      // missing or unreadable index — treat as empty
+      if (this.index === null) this.index = { version: 1, keys: {} }
+      return this.index
+    }
+  }
+
+  async saveIndex(): Promise<void> {
+    if (this.index === null) return
     await mkdir(ntPath(this.dir), { recursive: true })
-    const line = `${JSON.stringify({ ts: new Date().toISOString(), ...event })}\n`
-    await appendFile(ntPath(this.logPath), line, "utf8")
+    await atomicWrite(this.indexPath, `${JSON.stringify(this.index, null, 2)}\n`)
+    try {
+      this.indexMtimeMs = (await stat(ntPath(this.indexPath))).mtimeMs
+    } catch {
+      // mtime refresh is best-effort
+    }
+  }
+
+  /** Run an index load→mutate→save section under the index's own lock. */
+  async runLockedIndex<T>(fn: () => Promise<T>): Promise<T> {
+    return withLock(this.indexPath, fn)
+  }
+
+  /**
+   * Append under the log lock: every OpenCode window shares the global log,
+   * and unlocked concurrent appends interleave into broken JSON lines.
+   */
+  async log(event: LogEvent): Promise<void> {
+    await withLock(this.logPath, async () => {
+      await mkdir(ntPath(this.dir), { recursive: true })
+      const line = `${JSON.stringify({ ts: new Date().toISOString(), ...event })}\n`
+      await appendFile(ntPath(this.logPath), line, "utf8")
+    })
   }
 
   /** Caller must hold the lock. */
@@ -225,18 +299,149 @@ export class GateStore {
     return expired
   }
 
-  async rotateLog(): Promise<void> {
-    try {
-      const info = await stat(ntPath(this.logPath))
-      if (info.size < LOG_ROTATE_BYTES) return
-      const raw = await readFile(ntPath(this.logPath), "utf8")
-      const lines = raw.split("\n").filter((l) => l.trim() !== "")
-      const kept = lines.slice(-LOG_ROTATE_KEEP_LINES)
-      await writeFile(ntPath(this.logPath), `${kept.join("\n")}\n`, "utf8")
-    } catch {
-      // missing or unreadable log is fine
-    }
+  /** Remove gates by key; caller must hold the lock. Returns the removed gates. */
+  extract(keys: Set<string>): Gate[] {
+    if (this.gates === null) return []
+    const removed = this.gates.filter((g) => keys.has(g.key))
+    if (removed.length > 0) this.gates = this.gates.filter((g) => !keys.has(g.key))
+    return removed
   }
+
+  async rotateLog(): Promise<void> {
+    await withLock(this.logPath, async () => {
+      try {
+        const info = await stat(ntPath(this.logPath))
+        if (info.size < LOG_ROTATE_BYTES) return
+        const raw = await readFile(ntPath(this.logPath), "utf8")
+        const lines = raw.split("\n").filter((l) => l.trim() !== "")
+        const kept = lines.slice(-LOG_ROTATE_KEEP_LINES)
+        await atomicWrite(this.logPath, `${kept.join("\n")}\n`)
+      } catch {
+        // missing or unreadable log is fine
+      }
+    })
+  }
+
+  /**
+   * Structural self-healing (idempotent): unparseable gates.json is
+   * quarantined with its bytes preserved; parseable records are coerced,
+   * repaired and deduped; unparseable log lines are excised to
+   * log.jsonl.corrupt. Every repair is logged — healing must be visible.
+   */
+  async reconcile(): Promise<void> {
+    await withLock(this.gatesPath, async () => {
+      let raw: string | null = null
+      try {
+        raw = await readFile(ntPath(this.gatesPath), "utf8")
+      } catch {
+        // no gates file yet — nothing structural to heal
+      }
+      if (raw !== null && raw.trim() !== "") {
+        let parsed: Partial<GatesFile> | null = null
+        try {
+          parsed = JSON.parse(raw) as Partial<GatesFile>
+        } catch {
+          parsed = null
+        }
+        if (parsed === null || typeof parsed !== "object" || !Array.isArray(parsed.gates)) {
+          // SQLite-style quarantine: move aside, keep the bytes, start clean.
+          const quarantine = `${this.gatesPath}.corrupt-${Date.now()}`
+          try {
+            await rename(ntPath(this.gatesPath), ntPath(quarantine))
+            this.gates = []
+            this.mtimeMs = 0
+            await this.save()
+            await this.log({ type: "quarantined", key: "gates.json", snippet: `unparseable gates file moved to ${quarantine}` })
+          } catch {
+            // rename failed — next reconcile retries; never destroy the file
+          }
+        } else {
+          let dropped = 0
+          let repaired = 0
+          const byKey = new Map<string, Gate>()
+          for (const record of parsed.gates) {
+            const gate = coerceGateShape(record)
+            if (gate === null) {
+              dropped += 1
+              continue
+            }
+            if (repairGate(gate)) repaired += 1
+            const existing = byKey.get(gate.key)
+            if (existing) {
+              mergeGate(existing, gate)
+            } else {
+              byKey.set(gate.key, gate)
+            }
+          }
+          const merged = parsed.gates.length - dropped - byKey.size
+          this.gates = [...byKey.values()]
+          this.mtimeMs = 0
+          await this.save()
+          if (dropped > 0 || repaired > 0 || merged > 0) {
+            await this.log({
+              type: "repaired",
+              key: "gates.json",
+              snippet: `dropped ${dropped} hopeless record(s), repaired ${repaired}, merged ${merged} duplicate key(s)`,
+            })
+          }
+        }
+      }
+      await this.exciseCorruptLogLines()
+    })
+  }
+
+  /** Move unparseable JSONL lines to log.jsonl.corrupt; good lines stay. */
+  private async exciseCorruptLogLines(): Promise<void> {
+    let raw: string
+    try {
+      raw = await readFile(ntPath(this.logPath), "utf8")
+    } catch {
+      return // no log yet
+    }
+    const good: string[] = []
+    const bad: string[] = []
+    for (const line of raw.split("\n")) {
+      if (line.trim() === "") continue
+      try {
+        JSON.parse(line)
+        good.push(line)
+      } catch {
+        bad.push(line)
+      }
+    }
+    if (bad.length === 0) return
+    await withLock(this.logPath, async () => {
+      await appendFile(ntPath(`${this.logPath}.corrupt`), `${bad.join("\n")}\n`, "utf8")
+      await atomicWrite(this.logPath, good.length > 0 ? `${good.join("\n")}\n` : "")
+    })
+    await this.log({ type: "repaired", key: "log.jsonl", snippet: `excised ${bad.length} corrupt line(s) to log.jsonl.corrupt` })
+  }
+}
+
+/** Merge a gate's accumulated evidence into an existing gate with the same key. */
+function mergeGate(target: Gate, source: Gate): void {
+  // blocking is the stronger state — a merge must never demote an enforced gate
+  if (source.status === "blocking") target.status = "blocking"
+  target.count += source.count
+  for (const session of source.sessions) {
+    if (!target.sessions.includes(session)) target.sessions.push(session)
+  }
+  if (target.sessions.length > MAX_SESSIONS) target.sessions = target.sessions.slice(-MAX_SESSIONS)
+  for (const project of source.projects) {
+    if (!target.projects.includes(project)) target.projects.push(project)
+  }
+  if (target.projects.length > MAX_PROJECTS) target.projects = target.projects.slice(-MAX_PROJECTS)
+  if (source.firstSeen < target.firstSeen) target.firstSeen = source.firstSeen
+  if (source.lastSeen > target.lastSeen) {
+    target.lastSeen = source.lastSeen
+    target.snippet = source.snippet
+  }
+  target.remindedCount += source.remindedCount
+  target.blockedCount += source.blockedCount
+  target.recurredAfterReminder += source.recurredAfterReminder
+  target.recurredAfterGate += source.recurredAfterGate
+  if (target.correction === undefined && source.correction !== undefined) target.correction = source.correction
+  if (source.review === true) target.review = true
 }
 
 /**
@@ -309,6 +514,20 @@ export class Stores {
         }
       })
     }
+    // The cross-project index rots on the same schedule as the gates.
+    await this.globalStore.runLockedIndex(async () => {
+      const index = await this.globalStore.loadIndex(true)
+      const cutoff = Date.now() - ttlDays * DAY_MS
+      let changed = false
+      for (const key of Object.keys(index.keys)) {
+        const entry = index.keys[key]
+        if (entry && Date.parse(entry.lastSeen) < cutoff) {
+          delete index.keys[key]
+          changed = true
+        }
+      }
+      if (changed) await this.globalStore.saveIndex()
+    })
   }
 
   async rotateLogs(): Promise<void> {
@@ -321,6 +540,7 @@ export class Stores {
    * One-time (idempotent) schema/behavior migration:
    *  - probe-tool gates never block (they were learned under the old policy)
    *  - signatures and snippets are secret-scrubbed (cleans historical leaks)
+   *  - project copies of already-global keys merge into the global gate
    */
   async migrate(): Promise<void> {
     for (const store of this.scopes()) {
@@ -353,6 +573,112 @@ export class Stores {
         if (changed) await store.save()
       })
     }
+
+    // A key that reached the global store is global everywhere: merge any
+    // leftover project-local copy into the global gate so evidence does not
+    // fragment across scopes (stale local copies kept enforcing from the old
+    // scope while the global gate starved).
+    const projectStore = this.projectStore
+    if (projectStore) {
+      await projectStore.runLocked(async () => {
+        const projGates = await projectStore.load(true)
+        const globalKeys = new Set((await this.globalStore.load()).map((g) => g.key))
+        const dupes = projGates.filter((g) => globalKeys.has(g.key))
+        if (dupes.length === 0) return
+        await this.globalStore.runLocked(async () => {
+          const globalGates = await this.globalStore.load(true)
+          for (const dupe of dupes) {
+            const target = globalGates.find((g) => g.key === dupe.key)
+            if (target) {
+              mergeGate(target, dupe)
+            } else {
+              globalGates.push(dupe)
+            }
+          }
+          await this.globalStore.save()
+        })
+        projectStore.extract(new Set(dupes.map((g) => g.key)))
+        await projectStore.save()
+      })
+    }
+  }
+
+  /**
+   * Structural self-healing across both scopes plus index reconciliation.
+   * Idempotent; runs at plugin init and via `doctor --repair`.
+   */
+  async reconcileAll(globalProjects = 2): Promise<void> {
+    for (const store of this.scopes()) {
+      await store.reconcile()
+    }
+
+    // Index-driven escalation healing: a key proven in enough project dirs
+    // belongs in the global store even if recordFailure never moved it
+    // (racing instances, or stores that predate the index).
+    const projectStore = this.projectStore
+    if (projectStore) {
+      const index = await this.globalStore.loadIndex()
+      const toEscalate = (await projectStore.load(true)).filter((g) => {
+        const entry = index.keys[g.key]
+        return entry !== undefined && entry.projects.length >= globalProjects
+      })
+      if (toEscalate.length > 0) {
+        await projectStore.runLocked(async () => {
+          await this.globalStore.runLocked(async () => {
+            const globalGates = await this.globalStore.load(true)
+            for (const gate of toEscalate) {
+              const target = globalGates.find((g) => g.key === gate.key)
+              if (target) {
+                mergeGate(target, gate)
+              } else {
+                globalGates.push(gate)
+              }
+            }
+            await this.globalStore.save()
+          })
+          projectStore.extract(new Set(toEscalate.map((g) => g.key)))
+          await projectStore.save()
+        })
+        await this.globalStore.log({
+          type: "repaired",
+          key: "index.json",
+          snippet: `escalated ${toEscalate.length} gate(s) proven in ${globalProjects}+ project dirs`,
+        })
+      }
+    }
+
+    // The index must mirror reality: a key absent from every scope is an
+    // orphan (its gate expired or was deleted); a global gate missing from
+    // the index loses cross-project history. Heal both directions.
+    const knownKeys = new Set<string>()
+    for (const store of this.scopes()) {
+      for (const gate of await store.load(true)) knownKeys.add(gate.key)
+    }
+    await this.globalStore.runLockedIndex(async () => {
+      const index = await this.globalStore.loadIndex(true)
+      let pruned = 0
+      for (const key of Object.keys(index.keys)) {
+        if (!knownKeys.has(key)) {
+          delete index.keys[key]
+          pruned += 1
+        }
+      }
+      let rebuilt = 0
+      for (const gate of await this.globalStore.load(true)) {
+        if (!index.keys[gate.key]) {
+          index.keys[gate.key] = { projects: [...gate.projects], lastSeen: gate.lastSeen }
+          rebuilt += 1
+        }
+      }
+      if (pruned > 0 || rebuilt > 0) {
+        await this.globalStore.saveIndex()
+        await this.globalStore.log({
+          type: "repaired",
+          key: "index.json",
+          snippet: `pruned ${pruned} orphan key(s), rebuilt ${rebuilt} missing entr(y/ies)`,
+        })
+      }
+    })
   }
 
   async recordFailure(input: {
@@ -426,18 +752,41 @@ export class Stores {
 
       await store.save()
 
-      // Scope escalation: a pattern seen in enough distinct project directories
-      // is an agent-level habit, not a repo quirk — move it to the global store.
-      // Lock order is always project -> global, so no deadlock.
-      let wentGlobal = false
+      // Cross-project evidence lives in the global index: gate.projects only
+      // ever sees its own store's directory, so alone it can never reach two
+      // projects. A pattern seen in enough distinct project dirs is an
+      // agent-level habit, not a repo quirk — move it to the global store.
+      // Lock order is always gates -> index and project -> global: no cycles.
       const moved = gate
-      if (store !== this.globalStore && this.projectStore && gate.projects.length >= input.globalProjects) {
+      const indexProjects = await this.globalStore.runLockedIndex(async () => {
+        const index = await this.globalStore.loadIndex(true)
+        let entry = index.keys[input.key]
+        if (!entry) {
+          entry = { projects: [], lastSeen: now }
+          index.keys[input.key] = entry
+        }
+        if (input.projectDir !== "" && !entry.projects.includes(input.projectDir)) {
+          entry.projects.push(input.projectDir)
+          if (entry.projects.length > MAX_PROJECTS) entry.projects = entry.projects.slice(-MAX_PROJECTS)
+        }
+        entry.lastSeen = now
+        await this.globalStore.saveIndex()
+        return entry.projects.length
+      })
+
+      let wentGlobal = false
+      if (store !== this.globalStore && this.projectStore && indexProjects >= input.globalProjects) {
         const idx = gates.findIndex((g) => g.key === moved.key)
         if (idx >= 0) gates.splice(idx, 1)
         await store.save()
         await this.globalStore.runLocked(async () => {
           const globalGates = await this.globalStore.load(true)
-          if (!globalGates.some((g) => g.key === moved.key)) globalGates.push(moved)
+          const existing = globalGates.find((g) => g.key === moved.key)
+          if (existing) {
+            mergeGate(existing, moved)
+          } else {
+            globalGates.push(moved)
+          }
           await this.globalStore.save()
         })
         wentGlobal = true

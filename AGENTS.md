@@ -15,7 +15,8 @@ dejavu-opencode-plugin/
 ├── index.ts            # Plugin entry — exports Dejavu (Plugin factory) + all 4 hooks
 ├── src/
 │   ├── patterns.ts     # Pure engine: signatures, normalization, secret scrub, detection, blocking policy
-│   └── store.ts        # GateStore/Stores: two-scope persistence, locks, promotion, TTL, migration
+│   ├── store.ts        # GateStore/Stores: two-scope persistence, locks, promotion, TTL, migration, reconcile
+│   └── validate.ts     # Invariant layer: strict gate parsing + mechanical repair (parse-don't-validate boundary)
 ├── test/smoke.ts       # Behavioral smoke test — plain bun script, no framework, temp-dir isolated
 ├── scripts/            # doctor.ts (pathology report), analyze.ts (store summary), migrate.ts (demote+scrub)
 ├── command/dejavu.md   # /dejavu slash-command definition (install → ~/.config/opencode/command/)
@@ -30,8 +31,9 @@ dejavu-opencode-plugin/
 | Gate enforcement (remind/block/override) | `index.ts` `tool.execute.before` | state machine lives in per-session Maps |
 | Failure detection + recording | `index.ts` `tool.execute.after` + `event` | two channels: exit/text vs message stream |
 | Signature/normalization | `src/patterns.ts` | `callSignature`, `normalizeCommand`, `parameterizeError` |
-| Blocking policy | `src/patterns.ts:canBlock()` | single source of truth — bash non-diagnostics only |
-| Persistence, locks, promotion, global escalation | `src/store.ts` | `Stores.recordFailure()` is the core |
+| Blocking policy | `src/patterns.ts:canBlock()` | single source of truth — bash non-diagnostics, no bare `-c <str>` shapes |
+| Persistence, locks, promotion, global escalation | `src/store.ts` | `Stores.recordFailure()` is the core; cross-project evidence lives in global `index.json` |
+| Self-healing / reconcile | `src/store.ts` + `src/validate.ts` | `Stores.reconcileAll()` at every init; `doctor --repair` on demand |
 | Tunables | top of `index.ts` **and** `src/store.ts` | split: TTL/review caps in index, promote thresholds in store |
 | Pathology checks | `scripts/doctor.ts` | 5 defect classes: stale-blocking, not-teaching, annoying, secrets, version drift |
 
@@ -39,16 +41,22 @@ dejavu-opencode-plugin/
 
 | Symbol | Type | Location | Role |
 |--------|------|----------|------|
-| `Dejavu` | Plugin factory | index.ts:79 | entry point; wires 4 hooks, also `export default` |
-| `GateSignal` | class | index.ts:32 | sentinel error — the ONLY error rethrown from hooks |
-| `callSignature` | fn | src/patterns.ts:222 | stable call identity per tool (bash/read/edit/write/glob/grep) |
-| `patternKey` | fn | src/patterns.ts:250 | sha1 prefix-12 of signature — the gate key |
-| `canBlock` | fn | src/patterns.ts:130 | blocking policy gate |
-| `detectFailure` | fn | src/patterns.ts:320 | line-by-line bash-output failure scan |
-| `scrubSecrets` | fn | src/patterns.ts:34 | redaction before ANY persistence |
-| `GateStore` | class | src/store.ts:161 | one scope: gates.json + log.jsonl, mtime cache |
-| `Stores` | class | src/store.ts:246 | two-scope manager: findGate/recordFailure/migrate/expire |
-| `atomicWrite` / `withLock` | fn | src/store.ts:95/126 | Windows-safe fs primitives |
+| `Dejavu` | Plugin factory | index.ts:82 | entry point; wires 4 hooks, also `export default` |
+| `GateSignal` | class | index.ts:35 | sentinel error — the ONLY error rethrown from hooks |
+| `callSignature` | fn | src/patterns.ts:257 | stable call identity per tool (bash/read/edit/write/glob/grep) |
+| `patternKey` | fn | src/patterns.ts:285 | sha1 prefix-12 of signature — the gate key |
+| `canBlock` | fn | src/patterns.ts:163 | blocking policy gate |
+| `normalizeCommand` | fn | src/patterns.ts:72 | bash → signature; fingerprints interpreter one-liner payloads |
+| `hashInterpreterPayload` | fn | src/patterns.ts:56 | `-c`/`-e` code payload → `<code:hash>` (identity of one-liners) |
+| `detectFailure` | fn | src/patterns.ts:357 | line-by-line bash-output failure scan |
+| `isNoiseError` | fn | src/patterns.ts:383 | aborted/cancelled executions are not failures |
+| `scrubSecrets` | fn | src/patterns.ts:36 | redaction before ANY persistence |
+| `GateStore` | class | src/store.ts:175 | one scope: gates.json + index.json + log.jsonl, mtime caches, reconcile |
+| `Stores` | class | src/store.ts:452 | two-scope manager: findGate/recordFailure/migrate/expire/reconcileAll |
+| `mergeGate` | fn | src/store.ts:422 | evidence merge for dedupe/escalation (never demotes blocking) |
+| `coerceGateShape` | fn | src/validate.ts:20 | strict parse of a persisted gate record (hopeless → null) |
+| `repairGate` | fn | src/validate.ts:61 | mechanical repair: inverted dates, truncation, re-scrub, demote |
+| `atomicWrite` / `withLock` | fn | src/store.ts:106/137 | Windows-safe fs primitives |
 
 ## CONVENTIONS
 
@@ -63,14 +71,19 @@ dejavu-opencode-plugin/
 
 - Do NOT scan read/edit/write output for failure text — it is file CONTENT, not command output (caused false gates); file-tool failures come exclusively from the event channel
 - Do NOT count exit 1 from diagnostic verbs (grep/tsc/pytest/curl/ls...) as failure — intended outcome; exit ≥ 2 always counts (OpenCode normalizes exits to 1, so discriminate by command shape)
+- Do NOT count aborted/cancelled tool executions as failures — `isNoiseError()` filters them; they are infrastructure noise, not agent mistakes
+- Do NOT flatten interpreter one-liner payloads (`python -c`, `node -e`) to `<str>` — the code IS the call; `hashInterpreterPayload` fingerprints it so distinct scripts never share a gate
 - Do NOT persist anything before `scrubSecrets()` — signatures, snippets, args, error text, logs
 - Do NOT throw from hooks except `GateSignal` — plugin bugs must never break the tool pipeline
 - Do NOT let file-probe or diagnostic tools reach `blocking` status — `canBlock()` is the single source of truth; `migrate()` auto-demotes violations
 - Do NOT create gates manually — promotion is mechanical (3 failures × 2 sessions)
+- Do NOT delete quarantine files (`gates.json.corrupt-*`, `log.jsonl.corrupt`) without inspection — they are the preserved forensic bytes of corrupted data
+- Do NOT bypass the validation boundary — gates enter memory through `coerceGateShape`/`repairGate` (in `load()`) and structural healing through `reconcile()`; never hand-roll raw JSON reads/writes of store files
 
 ## UNIQUE STYLES
 
 - Two-scope store: project gates in `<repo>/.opencode/dejavu/` (committable) escalate to global `~/.config/opencode/dejavu/` after appearing in 2+ project dirs (agent habits vs repo quirks)
+- Self-healing stores: every init runs `reconcileAll()` — unparseable files are quarantined (bytes preserved in `*.corrupt-*`, never deleted), records are strictly parsed + mechanically repaired, index is reconciled, and every repair is logged (`repaired`/`quarantined` events); `doctor --repair` does the same on demand — one command replaces hand-debugging
 - `dejavu:proceed` escape hatch: trailing marker comment, matched with word boundaries, stripped before normalization so bypassed failures land on the original pattern
 - `recurredAfterGate` is THE health metric — gates that fire without killing the error get `review: true`
 - Windows-first fs: `\\?\` long-path prefix, tmp+rename with EPERM/EACCES/EBUSY backoff, lockfile with stale-steal and 3s degrade-to-unlocked (never hang the tool pipeline)
@@ -92,5 +105,5 @@ bun scripts/migrate.ts <projectDirs...>
 - CI: GitHub Actions (`bun install --frozen-lockfile` + typecheck + smoke) on every push/PR
 - Install = clone + re-export from `~/.config/opencode/plugins/dejavu.ts` (see README); npm publish planned
 - `DEJAVU_HOME` env var overrides the global store dir — smoke test and scripts rely on it
-- Bump `PLUGIN_VERSION` (src/store.ts:6) on behavior changes — doctor detects version drift via `init` log events
+- Bump `PLUGIN_VERSION` (src/store.ts:6) on behavior changes — doctor detects version drift via `init` log events — AND keep `package.json` `version` in sync (npm publish uses the package version)
 - gates.json files are human-editable by design: delete a gate object to disable, edit `correction` to teach

@@ -44,17 +44,40 @@ export function scrubSecrets(text: string): string {
 // --- Normalization -----------------------------------------------------------
 
 /**
+ * Interpreter one-liners: the quoted argument IS the program. Parameterizing
+ * it to <str> collapsed every script into one key — "python -c <str>" ended up
+ * blocking ALL python -c calls after three unrelated failures. Fingerprint the
+ * payload instead: same code = same key, different code = different key.
+ * Secrets are scrubbed before hashing so they neither persist nor fragment.
+ */
+const INTERPRETER_ONELINER =
+  /(?:^|[|;&(\n]\s*)(?:\S+[\\/])?(python3?|node|bun|deno|perl|ruby|pwsh|powershell)(?:\.exe)?(?:\s+-\w+)*\s+(-c|-e|--eval|-command)\s+/i
+
+function hashInterpreterPayload(command: string): string {
+  const match = INTERPRETER_ONELINER.exec(command)
+  if (!match) return command
+  const payload = command.slice(match.index + match[0].length)
+  if (payload.trim() === "") return command
+  // For whole (unchained) commands the payload runs to end of string; chain
+  // segments are normalized separately, so segment keys stay exact.
+  const fingerprint = createHash("sha1").update(scrubSecrets(payload)).digest("hex").slice(0, 8)
+  return `${command.slice(0, match.index + match[0].length)}<code:${fingerprint}>`
+}
+
+/**
  * Normalize a bash command into a stable signature.
  * Paths, numbers, quoted strings, hashes and agent comments are abstracted
  * away so that "same failure, different instance" collapses into one pattern.
  */
 export function normalizeCommand(command: string): string {
   let s = command.replace(COMMENT_LINE, "$1").toLowerCase()
+  s = hashInterpreterPayload(s)
   s = s.replace(/[a-z]:[\\/][^\s"']+/gi, " <path> ")
   s = s.replace(/(^|\s)\/[^\s"']+/g, "$1<path> ")
   s = s.replace(/"[^"]*"|'[^']*'/g, " <str> ")
-  s = s.replace(/\b[0-9a-f]{7,64}\b/gi, " <hash> ")
-  s = s.replace(/\b\d[\d.]*\b/g, " <n> ")
+  // lookbehind: never re-parameterize the <code:...> fingerprint hex
+  s = s.replace(/(?<!<code:)\b[0-9a-f]{7,64}\b/gi, " <hash> ")
+  s = s.replace(/(?<!<code:)\b\d[\d.]*\b/g, " <n> ")
   s = s.replace(/\s+/g, " ").trim()
   return s
 }
@@ -124,13 +147,23 @@ export function isIntendedNonzero(command: string, exitCode: number): boolean {
 }
 
 /**
+ * A code flag whose payload was entirely parameterized away (`-c <str>`)
+ * carries no identity — blocking that shape blocks the whole command family.
+ * New one-liners get <code:...> fingerprints in normalizeCommand; this guard
+ * keeps legacy pre-fingerprint gates (and lookalikes) from ever blocking.
+ */
+const GENERIC_ONELINER_SHAPE = /(^|\s)(-c|-e|--eval|-command)\s+(?:@\s+)?<str>(?:\s+@)?\s*$/i
+
+/**
  * Blocking policy: only bash commands that are NOT diagnostics may ever
  * become enforced gates. File probes and diagnostic queries are measured
  * (watching) but never interrupt the agent — the data showed blocking them
  * punishes normal work.
  */
 export function canBlock(tool: string, signature: string): boolean {
-  return tool === "bash" && !isDiagnosticSignature(signature)
+  if (tool !== "bash") return false
+  if (isDiagnosticSignature(signature)) return false
+  return !GENERIC_ONELINER_SHAPE.test(signature)
 }
 
 // --- Chain splitting ---------------------------------------------------------
@@ -281,14 +314,25 @@ export function levenshtein(a: string, b: string): number {
   return prev[n] ?? 0
 }
 
+/** Code fingerprints are IDENTITY, not data — they must match exactly. */
+const CODE_FINGERPRINTS = /<code:[0-9a-f]+>/g
+
 /**
  * Near-duplicate match: normalized edit distance <= 30% AND absolute distance
  * >= 3. Unlike token-set Jaccard, this does not collapse commands that merely
  * share placeholder tokens; the absolute floor stops verb-level-different
  * commands ("git push <str>" vs "git pull <str>" = distance 2) from merging.
+ * Signatures carrying <code:...> fingerprints only match if the fingerprints
+ * are identical — random hashes differing in 3 chars would otherwise pass the
+ * distance rule and merge unrelated one-liners into one gate.
  */
 export function fuzzySimilar(a: string, b: string): boolean {
   if (a === b) return true
+  const codesA = a.match(CODE_FINGERPRINTS)
+  const codesB = b.match(CODE_FINGERPRINTS)
+  if (codesA !== null || codesB !== null) {
+    if (codesA === null || codesB === null || codesA.join("\u0000") !== codesB.join("\u0000")) return false
+  }
   const maxLen = Math.max(a.length, b.length)
   if (maxLen === 0) return true
   const distance = levenshtein(a, b)
@@ -330,4 +374,23 @@ export function detectFailure(outputText: string): FailureDetection {
     }
   }
   return { matched: false, snippet: "" }
+}
+
+// --- Noise filtering ----------------------------------------------------------
+
+/**
+ * Infrastructure noise, not agent mistakes: aborted/cancelled executions
+ * (user hit stop, background task reaped) teach nothing and fragmented the
+ * store with unactionable patterns. Aborted != failed.
+ */
+const NOISE_ERRORS: RegExp[] = [
+  /tool execution aborted/i,
+  /execution was aborted/i,
+  /\baborted by user\b/i,
+  /\bcancelled by user\b/i,
+  /\bcanceled by user\b/i,
+]
+
+export function isNoiseError(errorText: string): boolean {
+  return NOISE_ERRORS.some((rule) => rule.test(errorText))
 }

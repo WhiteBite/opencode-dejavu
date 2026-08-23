@@ -6,6 +6,7 @@ import {
   callSignature,
   detectFailure,
   isIntendedNonzero,
+  isNoiseError,
   parameterizeError,
   patternKey,
   scrubSecrets,
@@ -105,15 +106,19 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
     }
   }
 
-  // Init: migrate old data, expire stale gates, rotate logs, warm the caches.
+  // Init: heal structural damage, migrate old data, expire stale gates,
+  // rotate logs, warm the caches.
   try {
+    await stores.reconcileAll(GLOBAL_PROJECTS)
     await stores.migrate()
     await stores.expireAll(TTL_DAYS)
     await stores.rotateLogs()
     await stores.logAll({ type: "init", key: "dejavu", version: PLUGIN_VERSION })
     await logClient("info", `dejavu initialized v${PLUGIN_VERSION}`)
-  } catch {
-    // init failures must not prevent hook registration
+  } catch (error) {
+    // init failures must not prevent hook registration — but must be visible,
+    // otherwise a corrupted store silently starts the plugin with no gates
+    await logClient("error", `dejavu init failed: ${error instanceof Error ? error.message : String(error)}`)
   }
 
   // Long-lived processes re-run expiry periodically.
@@ -347,6 +352,8 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
         // Never count our own gate signals as failures — a thrown REMINDER/BLOCK
         // comes back through this channel as a tool error.
         if (errorText.includes("[dejavu]")) return
+        // Aborted/cancelled executions are infrastructure noise, not mistakes.
+        if (isNoiseError(errorText)) return
         const session = typeof p.sessionID === "string" ? p.sessionID : "unknown"
 
         // Prefer the real call signature from the tool input — it keeps the gate

@@ -2,11 +2,11 @@
  * Behavioral smoke test for the dejavu state machine.
  * Run: bun test/smoke.ts
  */
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Dejavu } from "../index"
-import { callSignature, fuzzySimilar, parameterizeError, scrubSecrets, splitChain } from "../src/patterns"
+import { callSignature, canBlock, fuzzySimilar, parameterizeError, scrubSecrets, splitChain } from "../src/patterns"
 import { GateStore, Stores } from "../src/store"
 
 type Ctx = Parameters<typeof Dejavu>[0]
@@ -28,6 +28,8 @@ interface GateRow {
   count: number
   sessions: string[]
   snippet: string
+  firstSeen: string
+  lastSeen: string
 }
 
 let failures = 0
@@ -188,8 +190,24 @@ for (const [session, callID] of [["s4", "d1"], ["s4", "d2"], ["s5", "d3"]] as co
   )
 }
 gates = await readGates()
-const gate2 = gates.find((g) => g.signature === "bash:bun -e <str>")
+const gate2 = gates.find((g) => g.signature.startsWith("bash:bun -e <code:"))
 check("metadata.exit promotes gate with empty output text", gate2?.status === "blocking")
+check("interpreter payload is fingerprinted, not flattened to <str>", gate2 !== undefined && !gates.some((g) => g.signature === "bash:bun -e <str>"))
+
+// --- 7b. interpreter one-liners: the code IS the identity ---
+const PY_A = 'python -c "print(\'alpha\')"'
+const PY_B = 'python -c "print(\'beta\')"'
+check("same one-liner normalizes to one key", callSignature("bash", { command: PY_A }) === callSignature("bash", { command: PY_A }))
+check("different one-liner code gets different keys", callSignature("bash", { command: PY_A }) !== callSignature("bash", { command: PY_B }))
+// sha1 fingerprint of this payload is 14021754 — ALL digits (~2.3% of payloads);
+// the number-parameterization rule must not eat it or every such one-liner collapses
+const PY_DIGIT_FP = 'python -c "print(16)"'
+check("all-digit code fingerprint survives number parameterization", (callSignature("bash", { command: PY_DIGIT_FP }) ?? "").includes("<code:14021754>"))
+check(
+  "legacy bare-<str> interpreter shapes cannot block",
+  !canBlock("bash", "bash:python -c <str>") && !canBlock("bash", "bash:node -e <str>") && !canBlock("bash", "bash:& <str> -c @ <str> @"),
+)
+check("fingerprinted one-liners can still block", canBlock("bash", callSignature("bash", { command: PY_A }) ?? ""))
 
 // --- 8. chain bypass: a gated command hidden behind && still gets reminded ---
 const chained = await attempt(`echo ok && ${CMD}`, "s9", "c9")
@@ -288,6 +306,12 @@ gates = await readGates()
 const secGate = gates.find((g) => g.tool === "todo" && g.snippet.includes("<redacted>"))
 check("ingested snippets are secret-scrubbed", secGate !== undefined && !gates.some((g) => g.snippet.includes("sk-proj-")))
 
+// --- 15b. aborted/cancelled executions are noise, not failures ---
+await emitToolError("noise1", "background_output", "s60", "Tool execution aborted")
+await emitToolError("noise2", "background_output", "s61", "The tool execution was aborted by the user")
+gates = await readGates()
+check("aborted tool executions are not recorded", !gates.some((g) => g.tool === "background_output"))
+
 // --- 16. reminder wording teaches the trailing-comment bypass ---
 check("reminder explains trailing-comment bypass", first !== null && first.message.includes("# dejavu:proceed"))
 
@@ -321,34 +345,180 @@ check("env-style KEY=VALUE scrubbed", scrubSecrets("curl -H x --token SECRET_KEY
 // --- 20. fuzzy floor: verb-level-different commands must NOT merge ---
 check("git push vs git pull not fuzzy-similar", !fuzzySimilar("bash:git push <str>", "bash:git pull <str>"))
 check("real near-duplicates still fuzzy-similar", fuzzySimilar("bash:gradlew :app:compiletestjava", "bash:gradlew :web:compiletestjava"))
-
-// --- 21. scope escalation: pattern seen in 2 project dirs moves to global ---
-const escGlobal = new GateStore(join(tmp, "esc-global"))
-const escProject = new GateStore(join(tmp, "esc-project"))
-const escStores = new Stores(escGlobal, escProject)
-await escStores.recordFailure({
-  key: "esc0001",
-  signature: "bash:escalate me",
-  tool: "bash",
-  sessionID: "e1",
-  projectDir: join(tmp, "esc-project"),
-  snippet: "exit code 1",
-  globalProjects: 2,
-})
-await escStores.recordFailure({
-  key: "esc0001",
-  signature: "bash:escalate me",
-  tool: "bash",
-  sessionID: "e2",
-  projectDir: join(tmp, "other-project"),
-  snippet: "exit code 1",
-  globalProjects: 2,
-})
-const escProjGates = await escProject.load(true)
-const escGlobGates = await escGlobal.load(true)
 check(
-  "gate escalates to global after 2 project dirs",
-  escGlobGates.some((g) => g.key === "esc0001") && !escProjGates.some((g) => g.key === "esc0001"),
+  "different code fingerprints never fuzzy-merge (3-char hash distance passes the ratio rule)",
+  !fuzzySimilar("bash:python -c <code:14021754>", "bash:python -c <code:14021abc>"),
+)
+check(
+  "same fingerprint with surrounding variation still fuzzy-matches",
+  fuzzySimilar("bash:python -c <code:14021754>", "bash:python -c <code:14021754> --verbose"),
+)
+
+// --- 21. scope escalation, production-shaped: two project windows, one global store ---
+// Each Dejavu instance only sees its own project store — cross-project
+// visibility comes exclusively from the global index.
+const projA = join(tmp, "projA")
+const projB = join(tmp, "projB")
+const ctxA = { directory: projA, client: { app: { log: async () => ({}) } } } as unknown as Ctx
+const ctxB = { directory: projB, client: { app: { log: async () => ({}) } } } as unknown as Ctx
+const hooksA = await Dejavu(ctxA)
+const hooksB = await Dejavu(ctxB)
+const afterA = hooksA["tool.execute.after"] as AfterHook
+const afterB = hooksB["tool.execute.after"] as AfterHook
+const readJson = async (p: string): Promise<GateRow[]> =>
+  (JSON.parse(await readFile(p, "utf8")) as { gates: GateRow[] }).gates
+const failIn = (hook: AfterHook) => (session: string, callID: string, command: string): Promise<void> =>
+  hook(
+    { tool: "bash", sessionID: session, callID, args: { command } } as unknown as AfterInput,
+    { title: command, output: "npm ERR! boom\nExit code: 1", metadata: {} } as unknown as AfterOutput,
+  )
+const failA = failIn(afterA)
+const failB = failIn(afterB)
+const ESC_CMD = "deploy-tool --broken-flag"
+const escSig = `bash:${ESC_CMD}`
+const gatesAPath = join(projA, ".opencode", "dejavu", "gates.json")
+const gatesBPath = join(projB, ".opencode", "dejavu", "gates.json")
+const globalGatesPath = join(tmp, "global", "gates.json")
+
+await failA("ea1", "x1", ESC_CMD)
+await failA("ea1", "x2", ESC_CMD)
+await failA("ea2", "x3", ESC_CMD)
+check("pattern promotes in its own project store first", (await readJson(gatesAPath)).some((g) => g.signature === escSig && g.status === "blocking"))
+
+await failB("eb1", "x4", ESC_CMD)
+check("second project escalates the pattern to the global store", (await readJson(globalGatesPath)).some((g) => g.signature === escSig))
+check("escalated gate is spliced out of the second project store", !(await readJson(gatesBPath)).some((g) => g.signature === escSig))
+
+await Dejavu(ctxA) // next init in project A merges the leftover local copy into global
+const aGatesAfter = await readJson(gatesAPath)
+const globalGate = (await readJson(globalGatesPath)).find((g) => g.signature === escSig)
+check(
+  "project copy dedupes into the global gate on next init",
+  !aGatesAfter.some((g) => g.signature === escSig) && globalGate !== undefined && globalGate.count >= 4 && globalGate.sessions.length >= 3,
+)
+
+// --- 22. self-healing: corrupt gates.json is quarantined, plugin keeps working ---
+const sickDir = join(tmp, "sick-project")
+const sickDejavu = join(sickDir, ".opencode", "dejavu")
+await mkdir(sickDejavu, { recursive: true })
+await writeFile(join(sickDejavu, "gates.json"), "{ this is not json", "utf8")
+await Dejavu({ directory: sickDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+const quarantineFiles = (await readdir(sickDejavu)).filter((f) => f.startsWith("gates.json.corrupt-"))
+check("corrupt gates.json is quarantined with bytes kept", quarantineFiles.length === 1)
+check("quarantined bytes are preserved", (await readFile(join(sickDejavu, quarantineFiles[0] ?? ""), "utf8")).includes("this is not json"))
+check("plugin starts with a fresh store after quarantine", (await readJson(join(sickDejavu, "gates.json"))).length === 0)
+
+// --- 23. self-healing: reconcile merges duplicate keys and swaps inverted dates ---
+const healDir = join(tmp, "heal-project")
+const healDejavu = join(healDir, ".opencode", "dejavu")
+await mkdir(healDejavu, { recursive: true })
+const healBase = {
+  key: "beef00000001",
+  signature: "bash:heal me",
+  tool: "bash",
+  status: "watching",
+  count: 1,
+  sessions: ["h1"],
+  projects: [healDir],
+  firstSeen: "2026-08-20T00:00:00.000Z",
+  lastSeen: "2026-08-10T00:00:00.000Z",
+  snippet: "exit code 1",
+  remindedCount: 0,
+  blockedCount: 0,
+  recurredAfterReminder: 0,
+  recurredAfterGate: 0,
+}
+await writeFile(
+  join(healDejavu, "gates.json"),
+  JSON.stringify({ version: 1, gates: [{ ...healBase }, { ...healBase, count: 2, sessions: ["h2"] }] }),
+  "utf8",
+)
+await Dejavu({ directory: healDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+const healed = await readJson(join(healDejavu, "gates.json"))
+const healedGate = healed[0]
+check(
+  "duplicate keys merge and inverted dates swap on reconcile",
+  healed.length === 1 &&
+    healedGate !== undefined &&
+    healedGate.count === 3 &&
+    healedGate.sessions.length === 2 &&
+    healedGate.firstSeen <= healedGate.lastSeen,
+)
+
+// --- 24. self-healing: corrupt log lines excised, bytes preserved ---
+const logDir = join(tmp, "log-project")
+const logDejavu = join(logDir, ".opencode", "dejavu")
+await mkdir(logDejavu, { recursive: true })
+await writeFile(
+  join(logDejavu, "log.jsonl"),
+  `{"ts":"2026-08-23T00:00:00.000Z","type":"init","key":"dejavu","version":"2.1.0"}\n{broken line\n`,
+  "utf8",
+)
+await Dejavu({ directory: logDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+const healedLog = (await readFile(join(logDejavu, "log.jsonl"), "utf8")).split("\n").filter((l) => l.trim() !== "")
+check(
+  "live log has zero unparseable lines after reconcile",
+  healedLog.every((l) => {
+    try {
+      JSON.parse(l)
+      return true
+    } catch {
+      return false
+    }
+  }),
+)
+check("excised bytes preserved in log.jsonl.corrupt", (await readFile(join(logDejavu, "log.jsonl.corrupt"), "utf8").catch(() => "")).includes("{broken line"))
+
+// --- 25. self-healing: index orphans pruned, missing rebuilt, proven gates escalated ---
+const idxGlobalDir = join(tmp, "idx-global")
+const idxProjectDir = join(tmp, "idx-project")
+await mkdir(idxGlobalDir, { recursive: true })
+await mkdir(join(idxProjectDir, ".opencode", "dejavu"), { recursive: true })
+const idxGate = (key: string, signature: string): Record<string, unknown> => ({
+  key,
+  signature,
+  tool: "bash",
+  status: "watching",
+  count: 1,
+  sessions: ["i1"],
+  projects: [idxProjectDir],
+  firstSeen: "2026-08-23T00:00:00.000Z",
+  lastSeen: "2026-08-23T00:00:00.000Z",
+  snippet: "exit code 1",
+  remindedCount: 0,
+  blockedCount: 0,
+  recurredAfterReminder: 0,
+  recurredAfterGate: 0,
+})
+// global store: gate dddd without an index entry + orphan index key ffff
+await writeFile(join(idxGlobalDir, "gates.json"), JSON.stringify({ version: 1, gates: [idxGate("dddd00000001", "bash:index me")] }), "utf8")
+await writeFile(
+  join(idxGlobalDir, "index.json"),
+  JSON.stringify({
+    version: 1,
+    keys: {
+      ffff00000001: { projects: ["nowhere"], lastSeen: "2026-08-23T00:00:00.000Z" },
+      eeee00000001: { projects: ["projA", "projB"], lastSeen: "2026-08-23T00:00:00.000Z" },
+    },
+  }),
+  "utf8",
+)
+// project store: gate eeee proven in 2 project dirs (per index) but never escalated
+await writeFile(
+  join(idxProjectDir, ".opencode", "dejavu", "gates.json"),
+  JSON.stringify({ version: 1, gates: [idxGate("eeee00000001", "bash:escalate via index")] }),
+  "utf8",
+)
+const idxStores = new Stores(new GateStore(idxGlobalDir), new GateStore(join(idxProjectDir, ".opencode", "dejavu")))
+await idxStores.reconcileAll()
+const idxAfter = await new GateStore(idxGlobalDir).loadIndex(true)
+const idxGlobalGates = await new GateStore(idxGlobalDir).load(true)
+const idxProjectGates = await new GateStore(join(idxProjectDir, ".opencode", "dejavu")).load(true)
+check("orphan index key pruned", idxAfter.keys["ffff00000001"] === undefined)
+check("missing index entry rebuilt from the global gate", idxAfter.keys["dddd00000001"] !== undefined)
+check(
+  "gate proven in 2+ projects escalates to global on reconcile",
+  idxGlobalGates.some((g) => g.key === "eeee00000001") && !idxProjectGates.some((g) => g.key === "eeee00000001"),
 )
 
 await rm(tmp, { recursive: true, force: true })

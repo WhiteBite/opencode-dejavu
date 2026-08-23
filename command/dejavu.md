@@ -7,11 +7,12 @@ First run the pathology report (it surfaces every known defect class in one pass
     bun ~/.config/opencode/vendor/dejavu/scripts/doctor.ts <current directory>
 
 (If dejavu was cloned elsewhere, use that checkout's `scripts/doctor.ts`.)
+Add `--repair` to heal first (idempotent): quarantines corrupt files, merges duplicates, excises broken log lines, reconciles the index.
 
 Then read the state files for detail:
 
 - Project gates: `.opencode/dejavu/gates.json` in the current directory (may not exist yet)
-- Global gates: `~/.config/opencode/dejavu/gates.json`
+- Global gates: `~/.config/opencode/dejavu/gates.json` (plus `index.json` — cross-project evidence per key, machine-managed)
 - Event logs: `log.jsonl` next to each gates.json (last ~30 lines; events carry `channel`, `via`, `exit`, `version` fields for forensics)
 
 Report structure:
