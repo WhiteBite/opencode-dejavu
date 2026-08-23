@@ -6,7 +6,8 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Dejavu } from "../index"
-import { callSignature, parameterizeError, splitChain } from "../src/patterns"
+import { callSignature, fuzzySimilar, parameterizeError, scrubSecrets, splitChain } from "../src/patterns"
+import { GateStore, Stores } from "../src/store"
 
 type Ctx = Parameters<typeof Dejavu>[0]
 type Hooks = Awaited<ReturnType<typeof Dejavu>>
@@ -307,6 +308,48 @@ const freshDir = join(tmp, "fresh-project")
 await Dejavu({ directory: freshDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
 const freshLog = await readFile(join(freshDir, ".opencode", "dejavu", "log.jsonl"), "utf8").catch(() => "")
 check("init writes log in fresh project dir", freshLog.includes('"type":"init"'))
+
+// --- 19. scrubSecrets covers Google keys, full PEM blocks, KEY=VALUE secrets ---
+const PEM = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADKCAQEAtest\n-----END PRIVATE KEY-----"
+check(
+  "google api keys scrubbed",
+  scrubSecrets("export GOOGLE_API_KEY=AIzaSyABCDEFGHIJKLMNOPQRSTUVWXYZ012345678").includes("<redacted>"),
+)
+check("pem body scrubbed, not just header", !scrubSecrets(PEM).includes("MIIEvQIBADKCAQEAtest"))
+check("env-style KEY=VALUE scrubbed", scrubSecrets("curl -H x --token SECRET_KEY_BASE=abcdefghij1234567890abcd").includes("<redacted>"))
+
+// --- 20. fuzzy floor: verb-level-different commands must NOT merge ---
+check("git push vs git pull not fuzzy-similar", !fuzzySimilar("bash:git push <str>", "bash:git pull <str>"))
+check("real near-duplicates still fuzzy-similar", fuzzySimilar("bash:gradlew :app:compiletestjava", "bash:gradlew :web:compiletestjava"))
+
+// --- 21. scope escalation: pattern seen in 2 project dirs moves to global ---
+const escGlobal = new GateStore(join(tmp, "esc-global"))
+const escProject = new GateStore(join(tmp, "esc-project"))
+const escStores = new Stores(escGlobal, escProject)
+await escStores.recordFailure({
+  key: "esc0001",
+  signature: "bash:escalate me",
+  tool: "bash",
+  sessionID: "e1",
+  projectDir: join(tmp, "esc-project"),
+  snippet: "exit code 1",
+  globalProjects: 2,
+})
+await escStores.recordFailure({
+  key: "esc0001",
+  signature: "bash:escalate me",
+  tool: "bash",
+  sessionID: "e2",
+  projectDir: join(tmp, "other-project"),
+  snippet: "exit code 1",
+  globalProjects: 2,
+})
+const escProjGates = await escProject.load(true)
+const escGlobGates = await escGlobal.load(true)
+check(
+  "gate escalates to global after 2 project dirs",
+  escGlobGates.some((g) => g.key === "esc0001") && !escProjGates.some((g) => g.key === "esc0001"),
+)
 
 await rm(tmp, { recursive: true, force: true })
 

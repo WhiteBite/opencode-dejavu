@@ -1,8 +1,8 @@
 # PROJECT KNOWLEDGE BASE
 
-**Generated:** 2026-08-22
-**Commit:** none (fresh repo — all files untracked)
-**Branch:** master
+**Generated:** 2026-08-22 (refreshed 2026-08-23)
+**Commit:** ec439cd+
+**Branch:** main
 
 ## OVERVIEW
 
@@ -88,8 +88,9 @@ bun scripts/migrate.ts <projectDirs...>
 
 ## NOTES
 
-- `tsconfig.json` include = `index.ts` + `src/**` only → `scripts/` and `test/` are NOT typechecked
-- No CI, no commits yet; install = re-export from `~/.config/opencode/plugins/dejavu.ts` (README uses absolute path)
+- `tsconfig.json` covers `index.ts`, `src/**`, `scripts/**`, `test/**` — everything typechecks
+- CI: GitHub Actions (`bun install --frozen-lockfile` + typecheck + smoke) on every push/PR
+- Install = clone + re-export from `~/.config/opencode/plugins/dejavu.ts` (see README); npm publish planned
 - `DEJAVU_HOME` env var overrides the global store dir — smoke test and scripts rely on it
 - Bump `PLUGIN_VERSION` (src/store.ts:6) on behavior changes — doctor detects version drift via `init` log events
 - gates.json files are human-editable by design: delete a gate object to disable, edit `correction` to teach

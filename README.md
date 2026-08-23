@@ -56,7 +56,7 @@ Restart OpenCode. Gates appear automatically as failures recur — nothing to co
 - **Intended non-zero exits** — exit 1 from diagnostics is NOT a failure (that is their normal "found nothing / found issues" outcome). Exit ≥ 2 always counts.
 - **File content is not command output** — text failure signatures are scanned for `bash` only; `read`/`edit`/`write` failures come exclusively from the event channel (a file containing "TypeError" is not a failure).
 - **Concurrency** — gates.json mutations run under an exclusive lockfile; writes are tmp+rename with EPERM/EACCES/EBUSY retry (Windows AV/indexer). NT long paths get the `\\?\` prefix.
-- **Near-duplicate consolidation** — new failures merge into existing patterns via normalized Levenshtein ≤ 0.3 (replaces token Jaccard, which collapsed all `<str>` placeholders).
+- **Near-duplicate consolidation** — new failures merge into existing patterns via normalized Levenshtein ≤ 0.3 with an absolute floor of 3 edits (replaces token Jaccard, which collapsed all `<str>` placeholders; the floor stops `git push` vs `git pull`-style merges).
 - **Bounded memory** — per-session maps are capped (200 sessions) and freed on `session.deleted`; handled part IDs evict FIFO; TTL expiry re-runs every 6 h in long-lived processes.
 - **Migration** — gates outside the blocking policy are demoted to `watching` automatically; nothing is deleted.
 
@@ -77,7 +77,7 @@ Restart OpenCode. Gates appear automatically as failures recur — nothing to co
 | companion skill | agent behavior protocol (how to react, when to annotate) |
 | `/dejavu` command | status report: active gates, recurrence metric, review flags |
 
-Not covered (by design, v1): semantically-equivalent-but-syntactically-different failures beyond fuzzy (Levenshtein ≤ 0.3) matching.
+Not covered (by design, v1): semantically-equivalent-but-syntactically-different failures beyond fuzzy (Levenshtein ≤ 0.3, ≥ 3 edits) matching.
 
 ## Data files
 

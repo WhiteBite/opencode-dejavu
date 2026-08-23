@@ -27,7 +27,7 @@ Two dependency-free modules: `patterns.ts` (pure functions — call identity, no
 - Lock order is always project → global (see `recordFailure` escalation) — reversing deadlocks
 - Inside `runLocked` always `load(true)`; unlocked `load()` peeks are routing hints only, never a basis for mutation
 - `GateStore.load` caches by mtime — after external edits the cache refreshes on next stat; `save()` refreshes it manually
-- Fuzzy matching is Levenshtein-based on purpose: token Jaccard collapsed all `<str>` placeholders into one bucket
+- Fuzzy matching is Levenshtein-based on purpose: token Jaccard collapsed all `<str>` placeholders into one bucket; ratio ≤ 0.3 PLUS absolute distance ≥ 3 (verb-level-different commands must never merge)
 
 ## ANTI-PATTERNS
 

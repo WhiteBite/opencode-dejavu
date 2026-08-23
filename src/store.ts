@@ -190,6 +190,7 @@ export class GateStore {
       this.mtimeMs = info.mtimeMs
       return this.gates
     } catch {
+      // missing or unreadable gates.json — treat as an empty store
       if (this.gates === null) this.gates = []
       return this.gates
     }
@@ -340,6 +341,13 @@ export class Stores {
           if (snippet !== gate.snippet) {
             gate.snippet = snippet
             changed = true
+          }
+          if (gate.correction !== undefined) {
+            const correction = scrubSecrets(gate.correction)
+            if (correction !== gate.correction) {
+              gate.correction = correction
+              changed = true
+            }
           }
         }
         if (changed) await store.save()

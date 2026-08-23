@@ -26,7 +26,9 @@ const SECRET_PATTERNS: RegExp[] = [
   /gsk_[A-Za-z0-9]{20,}/g, // Groq
   /Bearer\s+[A-Za-z0-9_.-]{20,}/gi, // bearer tokens
   /\b(?:mongodb|postgres(?:ql)?|mysql|redis|amqp):\/\/[^:\s"']+:[^@\s"']+@[^\s"']+/gi, // db conn strings
-  /-----BEGIN\s+(?:[A-Z]+\s+)?PRIVATE KEY-----/g, // PEM private keys
+  /-----BEGIN\s+(?:[A-Z]+\s+)?PRIVATE KEY-----[\s\S]*?(?:-----END\s+(?:[A-Z]+\s+)?PRIVATE KEY-----|$)/g, // PEM private keys — full block incl. base64 body
+  /\bAIza[0-9A-Za-z_-]{35}/g, // Google API keys
+  /\b[A-Z][A-Z0-9_]{2,}=[A-Za-z0-9+=_-]{20,}/g, // .env-style KEY=<long-secret> assignments
   /eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g, // JWTs
   /\broot@[\w.-]+/gi, // ssh root@host — infrastructure exposure
 ]
@@ -63,7 +65,7 @@ export function normalizeCommand(command: string): string {
  * Order matters: quoted strings first, then specific tokens, numbers last.
  */
 const PARAM_RULES: [RegExp, string][] = [
-  [/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, "<str>"],
+  [/"[^"\\]*(?:\\.[^"\\]*)*"|'[^'\\]*(?:\\.[^'\\]*)*'/g, "<str>"], // unrolled loop: no catastrophic backtracking
   [/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi, "<uuid>"],
   [/\b[0-9a-f]{40}\b/gi, "<sha>"],
   [/\b[0-9a-f]{32}\b/gi, "<md5>"],
@@ -280,15 +282,17 @@ export function levenshtein(a: string, b: string): number {
 }
 
 /**
- * Near-duplicate match: normalized edit distance <= 30%. Unlike token-set
- * Jaccard, this does not collapse commands that merely share placeholder
- * tokens ("git push <str>" no longer matches every git push).
+ * Near-duplicate match: normalized edit distance <= 30% AND absolute distance
+ * >= 3. Unlike token-set Jaccard, this does not collapse commands that merely
+ * share placeholder tokens; the absolute floor stops verb-level-different
+ * commands ("git push <str>" vs "git pull <str>" = distance 2) from merging.
  */
 export function fuzzySimilar(a: string, b: string): boolean {
   if (a === b) return true
   const maxLen = Math.max(a.length, b.length)
   if (maxLen === 0) return true
-  return levenshtein(a, b) / maxLen <= 0.3
+  const distance = levenshtein(a, b)
+  return distance >= 3 && distance / maxLen <= 0.3
 }
 
 // --- Failure detection -------------------------------------------------------

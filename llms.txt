@@ -25,6 +25,8 @@ and failing again in the same session escalates to a hard BLOCK.
   Stripe/JWT/PEM/DB-conn patterns).
 - Gates expire after 60 days without recurrence; `recurredAfterGate` is the
   health metric; `scripts/doctor.ts` reports all pathology classes.
+- `DEJAVU_HOME` env var overrides the global store directory (testing,
+  custom setups).
 - Companion agent skill (skills/dejavu/SKILL.md) and `/dejavu` status command
   (command/dejavu.md).
 

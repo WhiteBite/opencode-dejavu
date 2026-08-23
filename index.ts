@@ -27,6 +27,8 @@ const SESSION_MAP_CAP = 200
 /** handled part IDs are capped FIFO-style */
 const HANDLED_CAP = 5000
 const HANDLED_KEEP = 2500
+/** pendingCalls capped — aborted calls never reach the after-hook, so a cap bounds the fallback map */
+const PENDING_CAP = 1000
 
 /** Sentinel: intentional gate/reminder throws (rethrown); our own bugs are swallowed. */
 class GateSignal extends Error {}
@@ -116,6 +118,7 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
 
   // Long-lived processes re-run expiry periodically.
   const ttlTimer = setInterval(() => {
+    // expiry is best-effort; the timer keeps running regardless
     stores.expireAll(TTL_DAYS).catch(() => {})
   }, TTL_INTERVAL_MS)
   ;(ttlTimer as { unref?: () => void }).unref?.()
@@ -127,7 +130,6 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
         const args = scrubbedArgs(rawArgs)
         const signature = callSignature(input.tool, args)
         if (!signature) return
-        if (typeof input.callID === "string") pendingCalls.set(input.callID, signature)
 
         // Chain-bypass protection: a gate on "rm -rf /" must also fire when the
         // command hides inside "git status && rm -rf /".
@@ -146,6 +148,16 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
           }
         }
         if (!found) return
+        // Only track calls that will actually run: an aborted (thrown) call never
+        // reaches the after-hook, so recording it earlier would leak forever.
+        if (typeof input.callID === "string") {
+          pendingCalls.set(input.callID, signature)
+          while (pendingCalls.size > PENDING_CAP) {
+            const oldest = pendingCalls.keys().next()
+            if (oldest.done) break
+            pendingCalls.delete(oldest.value)
+          }
+        }
 
         const gate = found.gate
         const via = found.via
