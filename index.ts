@@ -25,6 +25,12 @@ const TTL_INTERVAL_MS = 6 * 60 * 60 * 1000
 const REVIEW_FIRES = 10
 /** per-session state maps are capped to bound memory in long-lived processes */
 const SESSION_MAP_CAP = 200
+/** per-session key sets are capped too — one long session must not grow unbounded */
+const SESSION_KEY_CAP = 500
+/** a "retry" arriving this soon after a reminder was dispatched concurrently with it
+ * (same tool-call burst) and never saw the reminder — it gets reminded as well.
+ * A true agent retry needs a full model turn (≥1s in practice), so 500ms separates both. */
+const REMINDER_RACE_WINDOW_MS = 500
 /** handled part IDs are capped FIFO-style */
 const HANDLED_CAP = 5000
 const HANDLED_KEEP = 2500
@@ -41,10 +47,15 @@ function addToSetMap(map: Map<string, Set<string>>, outer: string, inner: string
     map.set(outer, set)
   }
   set.add(inner)
+  while (set.size > SESSION_KEY_CAP) {
+    const oldest = set.values().next()
+    if (oldest.done) break
+    set.delete(oldest.value)
+  }
 }
 
 /** Drop oldest entries (Map preserves insertion order) to bound memory. */
-function capMap(map: Map<string, Set<string>>, cap: number): void {
+function capMap<K, V>(map: Map<K, V>, cap: number): void {
   while (map.size > cap) {
     const oldest = map.keys().next()
     if (oldest.done) break
@@ -89,8 +100,8 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
       : null
   const stores = new Stores(globalStore, projectStore)
 
-  /** sessions in which a gate key was already reminded about */
-  const reminded = new Map<string, Set<string>>()
+  /** sessions in which a gate key was already reminded about; value = remind time (race guard) */
+  const reminded = new Map<string, Map<string, number>>()
   /** sessions in which a reminded pattern failed again — next attempt is blocked */
   const failedAfterReminder = new Map<string, Set<string>>()
   /** callID -> signature fallback when the after-hook does not receive args */
@@ -169,7 +180,10 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
         const session = typeof input.sessionID === "string" ? input.sessionID : "unknown"
 
         // Explicit escape hatch — checked only in the actionable text field,
-        // with word boundaries, so unrelated args cannot bypass gates.
+        // with word boundaries, so unrelated args cannot bypass gates. Quoted
+        // spans are stripped first: `echo "dejavu:proceed" && gated-cmd` must
+        // NOT bypass the gate on the chained command — the marker is a
+        // comment-style annotation, not data.
         const commandText =
           typeof rawArgs.command === "string"
             ? rawArgs.command
@@ -178,7 +192,7 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
               : typeof rawArgs.filePath === "string"
                 ? rawArgs.filePath
                 : ""
-        if (/\bdejavu:proceed\b/.test(commandText)) {
+        if (/\bdejavu:proceed\b/.test(commandText.replace(/"[^"]*"|'[^']*'/g, " "))) {
           await stores.logAll({ type: "override", key: gate.key, tool: gate.tool, session, project: directory })
           return
         }
@@ -193,9 +207,16 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
         }
 
         // First encounter this session -> remind (the call is aborted; agent may retry corrected).
-        if (!reminded.get(session)?.has(gate.key)) {
-          addToSetMap(reminded, session, gate.key)
-          addToSetMap(reminded, session, patternKey(signature)) // exact key too: retry may fuzzy-match differently
+        // Race guard: calls dispatched in the same burst all arrive before the agent can
+        // have seen any reminder, so a "retry" within REMINDER_RACE_WINDOW_MS of the
+        // remind is itself a concurrent first encounter and gets reminded too.
+        const sessionReminded = reminded.get(session) ?? new Map<string, number>()
+        if (!reminded.has(session)) reminded.set(session, sessionReminded)
+        const remindedAt = sessionReminded.get(gate.key)
+        if (remindedAt === undefined || Date.now() - remindedAt < REMINDER_RACE_WINDOW_MS) {
+          sessionReminded.set(gate.key, Date.now())
+          sessionReminded.set(patternKey(signature), Date.now()) // exact key too: retry may fuzzy-match differently
+          capMap(sessionReminded, SESSION_KEY_CAP)
           capMap(reminded, SESSION_MAP_CAP)
           gate.remindedCount += 1
           await found.store.save()

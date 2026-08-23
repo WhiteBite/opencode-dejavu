@@ -13,3 +13,5 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun run typecheck
       - run: bun test/smoke.ts
+      - run: bun test/property.ts
+      - run: bun test/fuzz.ts

@@ -4,7 +4,7 @@ import { canBlock, fuzzySimilar, scrubSecrets } from "./patterns"
 import { coerceGateShape, repairGate } from "./validate"
 
 /** Bumped on behavior changes; stamped into init log events so stale sessions are visible. */
-export const PLUGIN_VERSION = "2.2.0"
+export const PLUGIN_VERSION = "2.2.1"
 
 export interface Gate {
   /** sha1 signature prefix — the pattern identity */
@@ -62,6 +62,7 @@ export type LogEventType =
   | "init"
   | "repaired"
   | "quarantined"
+  | "degraded"
 
 export interface LogEvent {
   type: LogEventType
@@ -137,7 +138,7 @@ const LOCK_WAIT_MS = 3000
  * degradation: if the lock cannot be acquired within LOCK_WAIT_MS the
  * critical section runs unlocked rather than hanging the tool pipeline.
  */
-async function withLock<T>(lockTarget: string, fn: () => Promise<T>): Promise<T> {
+async function withLock<T>(lockTarget: string, fn: () => Promise<T>, onDegrade?: () => void): Promise<T> {
   const lock = `${lockTarget}.lock`
   await mkdir(ntPath(dirname(lock)), { recursive: true })
   const started = Date.now()
@@ -157,7 +158,11 @@ async function withLock<T>(lockTarget: string, fn: () => Promise<T>): Promise<T>
       } catch {
         continue // lock vanished between attempts
       }
-      if (Date.now() - started > LOCK_WAIT_MS) break
+      if (Date.now() - started > LOCK_WAIT_MS) {
+        // The only window where concurrent writes can lose updates — make it visible.
+        if (onDegrade) onDegrade()
+        break
+      }
       await new Promise((resolve) => setTimeout(resolve, 50))
     }
   }
@@ -194,7 +199,9 @@ export class GateStore {
 
   /** Run a load→mutate→save section under the store's exclusive lock. */
   async runLocked<T>(fn: () => Promise<T>): Promise<T> {
-    return withLock(this.gatesPath, fn)
+    return withLock(this.gatesPath, fn, () => {
+      this.log({ type: "degraded", key: "gates.lock", snippet: `lock contention exceeded ${LOCK_WAIT_MS}ms; critical section ran unlocked` }).catch(() => {})
+    })
   }
 
   /**
@@ -273,7 +280,9 @@ export class GateStore {
 
   /** Run an index load→mutate→save section under the index's own lock. */
   async runLockedIndex<T>(fn: () => Promise<T>): Promise<T> {
-    return withLock(this.indexPath, fn)
+    return withLock(this.indexPath, fn, () => {
+      this.log({ type: "degraded", key: "index.lock", snippet: `lock contention exceeded ${LOCK_WAIT_MS}ms; critical section ran unlocked` }).catch(() => {})
+    })
   }
 
   /**
@@ -776,9 +785,8 @@ export class Stores {
 
       let wentGlobal = false
       if (store !== this.globalStore && this.projectStore && indexProjects >= input.globalProjects) {
-        const idx = gates.findIndex((g) => g.key === moved.key)
-        if (idx >= 0) gates.splice(idx, 1)
-        await store.save()
+        // Global FIRST, then remove the local copy: a crash between the two
+        // writes must leave a duplicate (healed by migrate), never a hole.
         await this.globalStore.runLocked(async () => {
           const globalGates = await this.globalStore.load(true)
           const existing = globalGates.find((g) => g.key === moved.key)
@@ -789,6 +797,9 @@ export class Stores {
           }
           await this.globalStore.save()
         })
+        const idx = gates.findIndex((g) => g.key === moved.key)
+        if (idx >= 0) gates.splice(idx, 1)
+        await store.save()
         wentGlobal = true
       }
 

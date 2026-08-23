@@ -165,6 +165,7 @@ const first = await attempt(CMD, "s3", "c4")
 check("first attempt throws REMINDER", first !== null && first.message.includes("[dejavu] REMINDER"))
 
 // --- 3. one retry after the reminder is allowed through ---
+await new Promise((resolve) => setTimeout(resolve, 600)) // out of the concurrent-dispatch race window
 const retry = await attempt(CMD, "s3", "c5")
 check("retry after reminder is allowed", retry === null)
 
@@ -176,6 +177,21 @@ check("repeat failure after reminder throws BLOCKED", blocked !== null && blocke
 // --- 5. explicit override bypasses the gate ---
 const override = await attempt(`${CMD} # dejavu:proceed`, "s3", "c7")
 check("dejavu:proceed bypasses the gate", override === null)
+
+// --- 5b. override marker inside quoted strings must NOT bypass ---
+const smuggle = await attempt(`echo "dejavu:proceed" && ${CMD}`, "s-smuggle", "c-smuggle1")
+check("override marker inside quotes does not bypass", smuggle !== null && smuggle.message.includes("[dejavu] REMINDER"))
+
+// --- 5c. concurrent first encounters are all reminded; a true retry comes later ---
+const raceFirst = await attempt(CMD, "s-race", "r1")
+const raceSibling = await attempt(CMD, "s-race", "r2")
+check(
+  "call dispatched in the reminder burst is reminded too (race guard)",
+  raceFirst !== null && raceSibling !== null && raceSibling.message.includes("[dejavu] REMINDER"),
+)
+await new Promise((resolve) => setTimeout(resolve, 600))
+const raceRetry = await attempt(CMD, "s-race", "r3")
+check("retry after the race window is allowed", raceRetry === null)
 
 // --- 6. unrelated commands are untouched ---
 const unrelated = await attempt("git status", "s3", "c8")
@@ -218,6 +234,11 @@ check(
   "agent comments stripped from signatures",
   callSignature("bash", { command: "# probe the api\ngit status" }) === callSignature("bash", { command: "git status" }),
 )
+check(
+  "CRLF commands normalize identically to LF",
+  callSignature("bash", { command: "echo a\r\necho b" }) === callSignature("bash", { command: "echo a\necho b" }),
+)
+check("chain split handles CRLF", JSON.stringify(splitChain("echo a\r\necho b")) === JSON.stringify(["echo a", "echo b"]))
 check(
   "chain split separates &&, ||, |, ;",
   JSON.stringify(splitChain("a && b || c | d;e")) === JSON.stringify(["a", "b", "c", "d", "e"]),

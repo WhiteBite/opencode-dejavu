@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.2.1 — 2026-08-24
+
+### Fixed (adversarial-review round)
+- Escalation order: the gate is written to the global store BEFORE being removed from the project store — a crash between the two writes leaves a duplicate (healed by migrate), never a hole.
+- `dejavu:proceed` inside quoted strings no longer bypasses gates (`echo "dejavu:proceed" && gated-cmd` stays enforced); the marker is honored only outside quotes.
+- Concurrent first-encounter race: calls dispatched in the same burst as a REMINDER (within 500ms) are reminded too instead of slipping through as a "retry".
+- CRLF/CR commands normalize identically to LF; `splitChain` splits on CR — no more line-ending fragmentation.
+- `normalizeCommand` is fully idempotent: quoted spans are parameterized BEFORE path rules (a `<str>` substitution inserts spaces that would expose an adjacent `/` to the path rule only on a second pass), fingerprint payloads are trimmed, and already-parameterized payloads are never re-fingerprinted.
+- Interpreter flags glued to their payload (`node -e"code"`) fingerprint identically to the spaced form.
+- Session state maps: inner key sets are capped — long sessions no longer grow unbounded.
+
+### Added
+- Lock degradation (contention > 3s) emits a `degraded` log event — the only window where concurrent writes can lose updates is now visible.
+- `test/property.ts` — property-based tests for the normalization pipeline (idempotency, no nested tokens, output bound, one-liner distinctness, marker neutrality, splitChain atomicity).
+- `test/fuzz.ts` — seeded mutation fuzzer with a metamorphic oracle and case shrinking; both harnesses run in CI. The harnesses caught the idempotency, marker-neutrality, glued-flag and nested-token-detector bugs above before production did.
+
 ## 2.2.0 — 2026-08-23
 
 ### Added

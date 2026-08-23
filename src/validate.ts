@@ -97,11 +97,11 @@ export function repairGate(gate: Gate): boolean {
 }
 
 /**
- * Corruption fingerprint of tokens re-parameterized inside other tokens
- * (e.g. `<code: <n> >` — a fingerprint eaten by the number rule). Such a
- * signature is stable under re-normalization, so only an explicit shape
- * check catches it.
+ * Corruption fingerprint of a placeholder re-parameterized inside another
+ * token (`<code: <n> >` — a fingerprint eaten by the number rule). Only the
+ * `<code:` token carries nested content, so the check is scoped to it —
+ * shell text like heredoc `<<eof:` must NOT trip the detector.
  */
 export function hasNestedTokens(signature: string): boolean {
-  return /<[a-z]+:\s*</.test(signature)
+  return /<code:\s*</.test(signature)
 }

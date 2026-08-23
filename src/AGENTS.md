@@ -24,11 +24,13 @@ Two dependency-free modules: `patterns.ts` (pure functions — call identity, no
 ## INVARIANTS (do not break)
 
 - Rule order in `PARAM_RULES` matters: quoted strings first, specific tokens (uuid/sha/ip/url/date), generic numbers last — reordering fragments signatures
+- Rule order in `normalizeCommand` matters too: quoted strings are parameterized BEFORE path rules — a `<str>` substitution inserts spaces that would expose an adjacent `/` to the path rule on a second pass (idempotency); interpreter payload hashing runs while the payload is still raw
 - `scrubSecrets()` runs on every string before it touches disk; `recordFailure` re-scrubs defensively
 - `canBlock(tool, sig)` = bash && non-diagnostic && not a bare one-liner shape — the ONLY path to `blocking`; probe tools use `PROMOTE_COUNT_PROBE` and never block
 - `DIAGNOSTIC_VERBS` serves two callers (exit-1 allowlist + blocking policy) — one list, two uses; edit knowing both move
 - Lock order is always project → global, gates → index (see `recordFailure` escalation) — reversing deadlocks; the log lock is separate and leaf-level
 - Cross-project evidence lives ONLY in the global `index.json` — a gate's own `projects` array sees one store and never drives escalation alone
+- Escalation writes the global gate FIRST, then removes the project copy — a crash between the two writes must leave a duplicate (healed by migrate), never a hole
 - Inside `runLocked` always `load(true)`; unlocked `load()` peeks are routing hints only, never a basis for mutation
 - `GateStore.load` caches by mtime — after external edits the cache refreshes on next stat; `save()` refreshes it manually
 - Log appends and rotation take the log lock — every OpenCode window shares the global log; unlocked appends interleave into broken JSON

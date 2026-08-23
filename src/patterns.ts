@@ -51,16 +51,24 @@ export function scrubSecrets(text: string): string {
  * Secrets are scrubbed before hashing so they neither persist nor fragment.
  */
 const INTERPRETER_ONELINER =
-  /(?:^|[|;&(\n]\s*)(?:\S+[\\/])?(python3?|node|bun|deno|perl|ruby|pwsh|powershell)(?:\.exe)?(?:\s+-\w+)*\s+(-c|-e|--eval|-command)\s+/i
+  /(?:^|[|;&(\n]\s*)(?:\S+[\\/])?(python3?|node|bun|deno|perl|ruby|pwsh|powershell)(?:\.exe)?(?:\s+-\w+)*\s+(-c|-e|--eval|-command)\s*/i
 
 function hashInterpreterPayload(command: string): string {
   const match = INTERPRETER_ONELINER.exec(command)
   if (!match) return command
   const payload = command.slice(match.index + match[0].length)
   if (payload.trim() === "") return command
+  // Already fingerprinted (re-normalization) — keep the existing token so
+  // normalizeCommand stays idempotent.
+  if (/^<code:[0-9a-f]+>$/.test(payload.trim())) return command
+  // Already-parameterized placeholders are data, not code — never hash them
+  // (idempotency: a second pass must not fingerprint a <str>).
+  if (/^(?:<(?:str|path|n|hash|uuid|sha|md5|ip|url|email|date)>\s*)+$/.test(payload.trim())) return command
   // For whole (unchained) commands the payload runs to end of string; chain
   // segments are normalized separately, so segment keys stay exact.
-  const fingerprint = createHash("sha1").update(scrubSecrets(payload)).digest("hex").slice(0, 8)
+  // Trim before hashing: trailing whitespace (e.g. a stripped override marker)
+  // is not part of the code's identity.
+  const fingerprint = createHash("sha1").update(scrubSecrets(payload.trim())).digest("hex").slice(0, 8)
   return `${command.slice(0, match.index + match[0].length)}<code:${fingerprint}>`
 }
 
@@ -70,11 +78,18 @@ function hashInterpreterPayload(command: string): string {
  * away so that "same failure, different instance" collapses into one pattern.
  */
 export function normalizeCommand(command: string): string {
-  let s = command.replace(COMMENT_LINE, "$1").toLowerCase()
+  // CRLF/CR commands (Windows pastes, agent multi-line) normalize to LF —
+  // otherwise the same command fragments across line-ending styles.
+  let s = command.replace(/\r\n?/g, "\n")
+  s = s.replace(COMMENT_LINE, "$1").toLowerCase()
   s = hashInterpreterPayload(s)
+  // Quoted spans come out FIRST: they are data, and removing them before the
+  // path rules keeps normalization idempotent — a <str> replacement inserts
+  // spaces that would otherwise expose an adjacent "/" to the path rule only
+  // on a second pass.
+  s = s.replace(/"[^"]*"|'[^']*'/g, " <str> ")
   s = s.replace(/[a-z]:[\\/][^\s"']+/gi, " <path> ")
   s = s.replace(/(^|\s)\/[^\s"']+/g, "$1<path> ")
-  s = s.replace(/"[^"]*"|'[^']*'/g, " <str> ")
   // lookbehind: never re-parameterize the <code:...> fingerprint hex
   s = s.replace(/(?<!<code:)\b[0-9a-f]{7,64}\b/gi, " <hash> ")
   s = s.replace(/(?<!<code:)\b\d[\d.]*\b/g, " <n> ")
@@ -213,7 +228,7 @@ export function splitChain(command: string): string[] {
       continue
     }
     if (depth === 0) {
-      if (ch === ";" || ch === "\n") {
+      if (ch === ";" || ch === "\n" || ch === "\r") {
         flush()
         i += 1
         continue
