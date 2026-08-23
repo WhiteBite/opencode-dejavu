@@ -34,6 +34,15 @@ Design decisions (post-mortem of existing approaches):
 
 ## Install
 
+**npm (recommended)** — one line, OpenCode installs it automatically at startup:
+
+```jsonc
+// ~/.config/opencode/opencode.json (global) or opencode.json (project)
+{ "plugin": ["opencode-dejavu"] }
+```
+
+**From source:**
+
 ```bash
 git clone https://github.com/WhiteBite/opencode-dejavu ~/.config/opencode/vendor/dejavu
 cd ~/.config/opencode/vendor/dejavu && bun install
