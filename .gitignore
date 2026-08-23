@@ -1,0 +1,7 @@
+node_modules/
+dist/
+*.tmp
+*.log
+.omo/
+.codegraph/
+.playwright-mcp/

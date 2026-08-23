@@ -1,0 +1,69 @@
+# dejavu — OpenCode error-gate plugin
+
+> Cross-session memory prosthesis with teeth for OpenCode: mechanically detects
+> recurring tool-call failures and promotes them into enforced gates. Remind
+> first, hard-block on same-session repeat offense. TypeScript + Bun, ships as
+> source, no build step.
+
+## What it does
+
+Dejavu watches OpenCode tool calls (bash, read, edit, write, glob, grep) fail,
+normalizes each call into a stable signature (paths/numbers/hashes/secrets
+stripped), counts recurrences across sessions, and promotes a pattern into an
+enforced gate after 3 failures across 2 distinct sessions. The next attempt at
+a gated call is aborted with a REMINDER carrying the correction; retrying it
+and failing again in the same session escalates to a hard BLOCK.
+
+## Key properties
+
+- Two scopes: project gates in `<repo>/.opencode/dejavu/gates.json` escalate
+  to global `~/.config/opencode/dejavu/gates.json` after appearing in 2+
+  project directories.
+- Blocking policy: only non-diagnostic bash commands may block; file probes
+  and diagnostics stay `watching` forever (`canBlock()` in src/patterns.ts).
+- Secret scrubbing before any persistence (OpenAI/Anthropic/AWS/GitHub/Slack/
+  Stripe/JWT/PEM/DB-conn patterns).
+- Gates expire after 60 days without recurrence; `recurredAfterGate` is the
+  health metric; `scripts/doctor.ts` reports all pathology classes.
+- Companion agent skill (skills/dejavu/SKILL.md) and `/dejavu` status command
+  (command/dejavu.md).
+
+## Installation
+
+```bash
+git clone https://github.com/WhiteBite/opencode-dejavu ~/.config/opencode/vendor/dejavu
+```
+
+```ts
+// ~/.config/opencode/plugins/dejavu.ts
+export { Dejavu } from "../vendor/dejavu/index.ts"
+```
+
+## Files
+
+- [index.ts](./index.ts): plugin entry — `Dejavu` factory, 4 hooks
+  (tool.execute.before/after, event, experimental.session.compacting)
+- [src/patterns.ts](./src/patterns.ts): signature normalization, secret
+  scrubbing, failure detection, blocking policy, fuzzy matching
+- [src/store.ts](./src/store.ts): GateStore/Stores — two-scope persistence,
+  lockfiles, promotion, TTL expiry, migration
+- [test/smoke.ts](./test/smoke.ts): behavioral smoke test (`bun test/smoke.ts`)
+- [scripts/doctor.ts](./scripts/doctor.ts): pathology report
+- [scripts/analyze.ts](./scripts/analyze.ts): store summary
+- [scripts/migrate.ts](./scripts/migrate.ts): demote + scrub migration
+- [AGENTS.md](./AGENTS.md): coding-agent context for this repository
+- [skills/dejavu/SKILL.md](./skills/dejavu/SKILL.md): companion agent protocol
+- [command/dejavu.md](./command/dejavu.md): /dejavu status command
+
+## Commands
+
+```bash
+bun install
+bun run typecheck        # tsc --noEmit
+bun test/smoke.ts        # behavioral test suite
+bun scripts/doctor.ts [projectDirs...]
+```
+
+## License
+
+MIT
