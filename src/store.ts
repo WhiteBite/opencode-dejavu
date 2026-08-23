@@ -4,7 +4,7 @@ import { canBlock, fuzzySimilar, FUZZY_MAX_LEN, scrubSecrets } from "./patterns"
 import { coerceGateShape, repairGate } from "./validate"
 
 /** Bumped on behavior changes; stamped into init log events so stale sessions are visible. */
-export const PLUGIN_VERSION = "2.3.0"
+export const PLUGIN_VERSION = "2.3.1"
 
 export interface Gate {
   /** sha1 signature prefix — the pattern identity */
@@ -36,8 +36,10 @@ export interface Gate {
    * Persisted on the gate so the remind→block chain survives process restarts
    * and is visible to every window serving the session. */
   remindedSessions?: Record<string, number>
-  /** sessions that failed again after a reminder — their next attempt blocks */
-  failedSessions?: string[]
+  /** sessions that failed again after a reminder: sessionID -> fail time (ms).
+   * Their next attempt blocks. Expires like remindedSessions — a stale block
+   * with no live session is a leak, not enforcement. */
+  failedSessions?: Record<string, number>
 }
 
 interface GatesFile {
@@ -104,6 +106,9 @@ export const PROMOTE_COUNT_PROBE = 5
 export const PROBE_TOOLS = new Set(["read", "glob", "grep", "write", "edit"])
 /** distinct sessions required — same-session loops never promote */
 export const PROMOTE_SESSIONS = 2
+/** store size bound: flooding with unique failures must not bloat gates.json
+ * or slow the fuzzy scan — the weakest watching gate is evicted past this */
+export const MAX_GATES = 2000
 
 // --- Windows-safe fs helpers -------------------------------------------------
 
@@ -406,15 +411,19 @@ export class GateStore {
         }
         if (parsed === null || typeof parsed !== "object" || !Array.isArray(parsed.gates)) {
           // SQLite-style quarantine: move aside, keep the bytes, start clean.
+          // Scrub before preserving — raw bytes may carry unredacted secrets.
           const quarantine = `${this.gatesPath}.corrupt-${Date.now()}`
           try {
-            await rename(ntPath(this.gatesPath), ntPath(quarantine))
+            await writeFile(ntPath(quarantine), scrubSecrets(raw), "utf8")
+            await unlink(ntPath(this.gatesPath))
             this.gates = []
+            this.keyIndex = null
+            this.blockingCache = null
             this.mtimeMs = 0
             await this.save()
-            await this.log({ type: "quarantined", key: "gates.json", snippet: `unparseable gates file moved to ${quarantine}` })
+            await this.log({ type: "quarantined", key: "gates.json", snippet: `unparseable gates file quarantined (scrubbed) to ${quarantine}` })
           } catch {
-            // rename failed — next reconcile retries; never destroy the file
+            // quarantine failed — next reconcile retries; never destroy the file
           }
         } else {
           let dropped = 0
@@ -472,7 +481,8 @@ export class GateStore {
     }
     if (bad.length === 0) return
     await withLock(this.logPath, async () => {
-      await appendFile(ntPath(`${this.logPath}.corrupt`), `${bad.join("\n")}\n`, "utf8")
+      // Scrub: excised raw lines may carry unredacted secrets.
+      await appendFile(ntPath(`${this.logPath}.corrupt`), `${scrubSecrets(bad.join("\n"))}\n`, "utf8")
       await atomicWrite(this.logPath, good.length > 0 ? `${good.join("\n")}\n` : "")
     })
     await this.log({ type: "repaired", key: "log.jsonl", snippet: `excised ${bad.length} corrupt line(s) to log.jsonl.corrupt` })
@@ -480,7 +490,7 @@ export class GateStore {
 }
 
 /** Merge a gate's accumulated evidence into an existing gate with the same key. */
-function mergeGate(target: Gate, source: Gate): void {
+export function mergeGate(target: Gate, source: Gate): void {
   // blocking is the stronger state — a merge must never demote an enforced gate
   if (source.status === "blocking") target.status = "blocking"
   target.count += source.count
@@ -503,6 +513,24 @@ function mergeGate(target: Gate, source: Gate): void {
   target.recurredAfterGate += source.recurredAfterGate
   if (target.correction === undefined && source.correction !== undefined) target.correction = source.correction
   if (source.review === true) target.review = true
+  // Session enforcement state must survive merges — dropping it silently
+  // resets the remind→block chain on every escalation/dedupe.
+  if (source.remindedSessions !== undefined) {
+    if (target.remindedSessions === undefined) target.remindedSessions = {}
+    for (const session of Object.keys(source.remindedSessions)) {
+      const at = source.remindedSessions[session] ?? 0
+      const existing = target.remindedSessions[session]
+      if (existing === undefined || at > existing) target.remindedSessions[session] = at
+    }
+  }
+  if (source.failedSessions !== undefined) {
+    if (target.failedSessions === undefined) target.failedSessions = {}
+    for (const session of Object.keys(source.failedSessions)) {
+      const at = source.failedSessions[session] ?? 0
+      const existing = target.failedSessions[session]
+      if (existing === undefined || at > existing) target.failedSessions[session] = at
+    }
+  }
 }
 
 /**
@@ -612,9 +640,9 @@ export class Stores {
             if (Object.keys(gate.remindedSessions).length === 0) delete gate.remindedSessions
             changed = true
           }
-          if (gate.failedSessions !== undefined && gate.failedSessions.includes(sessionID)) {
-            gate.failedSessions = gate.failedSessions.filter((s) => s !== sessionID)
-            if (gate.failedSessions.length === 0) delete gate.failedSessions
+          if (gate.failedSessions !== undefined && gate.failedSessions[sessionID] !== undefined) {
+            delete gate.failedSessions[sessionID]
+            if (Object.keys(gate.failedSessions).length === 0) delete gate.failedSessions
             changed = true
           }
         }
@@ -793,12 +821,52 @@ export class Stores {
     return store.runLocked(async () => {
       const gates = await store.load(true)
       let gate = gates.find((g) => g.key === input.key)
+      let fuzzyConsolidated = false
       // Consolidation: same tool + near-duplicate signature merges into the
       // existing pattern instead of fragmenting ("gradlew :x:compiletestjava").
       if (!gate) {
-        gate = gates.find((g) => g.tool === input.tool && fuzzySimilar(input.signature, g.signature))
+        // Prefer the gate this session was already reminded about: the
+        // before-hook enforced from it, so the failure must land there too —
+        // otherwise the remind→block chain desyncs between the hooks.
+        const fuzzyMatches = gates.filter((g) => g.tool === input.tool && fuzzySimilar(input.signature, g.signature))
+        gate = fuzzyMatches.find((g) => g.remindedSessions?.[input.sessionID] !== undefined) ?? fuzzyMatches[0]
+        if (gate !== undefined) fuzzyConsolidated = true
       }
       if (!gate) {
+        // Flood guard: unique-failure spam must not grow the store unbounded.
+        if (gates.length >= MAX_GATES) {
+          let victimIdx = -1
+          for (let i = 0; i < gates.length; i++) {
+            const candidate = gates[i]
+            if (candidate === undefined || candidate.status !== "watching") continue
+            const victim = victimIdx >= 0 ? gates[victimIdx] : undefined
+            if (victim === undefined || candidate.count < victim.count || (candidate.count === victim.count && candidate.lastSeen < victim.lastSeen)) {
+              victimIdx = i
+            }
+          }
+          if (victimIdx < 0) {
+            // Every gate is enforced — do not create; degrade gracefully with
+            // an ephemeral gate that is never persisted.
+            const ephemeral: Gate = {
+              key: input.key,
+              signature: scrubSecrets(input.signature),
+              tool: input.tool,
+              status: "watching",
+              count: 1,
+              sessions: [input.sessionID],
+              projects: input.projectDir !== "" ? [input.projectDir] : [],
+              firstSeen: now,
+              lastSeen: now,
+              snippet: scrubSecrets(input.snippet),
+              remindedCount: 0,
+              blockedCount: 0,
+              recurredAfterReminder: 0,
+              recurredAfterGate: 0,
+            }
+            return { gate: ephemeral, store, promoted: false, wentGlobal: false }
+          }
+          gates.splice(victimIdx, 1)
+        }
         gate = {
           key: input.key,
           signature: scrubSecrets(input.signature),
@@ -826,7 +894,9 @@ export class Stores {
         if (gate.projects.length > MAX_PROJECTS) gate.projects = gate.projects.slice(-MAX_PROJECTS)
       }
       gate.lastSeen = now
-      gate.snippet = scrubSecrets(input.snippet)
+      // Only an exact-key failure updates the evidence: a crafted near-duplicate
+      // must not overwrite a legitimate gate's snippet via fuzzy consolidation.
+      if (!fuzzyConsolidated) gate.snippet = scrubSecrets(input.snippet)
 
       let promoted = false
       const threshold = PROBE_TOOLS.has(input.tool) ? PROMOTE_COUNT_PROBE : PROMOTE_COUNT

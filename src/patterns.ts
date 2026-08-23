@@ -30,6 +30,12 @@ const SECRET_PATTERNS: RegExp[] = [
   /\bAIza[0-9A-Za-z_-]{35}/g, // Google API keys
   /\b[A-Z][A-Z0-9_]{2,}=[A-Za-z0-9+=_-]{20,}/g, // .env-style KEY=<long-secret> assignments
   /eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g, // JWTs
+  /hf_[A-Za-z0-9]{20,}/g, // Hugging Face
+  /dop_v1_[A-Za-z0-9]{20,}/g, // DigitalOcean
+  /vercel_[A-Za-z0-9]{20,}/g, // Vercel
+  /NRAK-[A-Z0-9]{20,}/g, // New Relic
+  /SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}/g, // SendGrid
+  /\b(?:api[_-]?key|secret(?:[_-]?key)?|access[_-]?token|auth[_-]?token|client[_-]?secret|password|passwd)\b\s*[:=]\s*['"]?[A-Za-z0-9+/_=.-]{16,}/gi, // generic key=<long value> assignments
   /\broot@[\w.-]+/gi, // ssh root@host — infrastructure exposure
 ]
 

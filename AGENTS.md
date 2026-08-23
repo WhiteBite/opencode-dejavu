@@ -54,7 +54,7 @@ dejavu-opencode-plugin/
 | `scrubSecrets` | fn | src/patterns.ts:36 | redaction before ANY persistence |
 | `GateStore` | class | src/store.ts:190 | one scope: gates.json + index.json + log.jsonl, TTL caches, key index |
 | `Stores` | class | src/store.ts:513 | two-scope manager: findGate/recordFailure/migrate/expire/reconcileAll/forgetSession |
-| `mergeGate` | fn | src/store.ts:483 | evidence merge for dedupe/escalation (never demotes blocking) |
+| `mergeGate` | fn | src/store.ts:483 | evidence merge for dedupe/escalation (never demotes blocking, preserves session state) |
 | `coerceGateShape` | fn | src/validate.ts:24 | strict parse of a persisted gate record (hopeless → null) |
 | `repairGate` | fn | src/validate.ts:76 | mechanical repair: inverted dates, truncation, re-scrub, demote, session-state hygiene |
 | `atomicWrite` / `withLock` | fn | src/store.ts:120/151 | Windows-safe fs primitives |

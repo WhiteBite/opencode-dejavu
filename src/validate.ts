@@ -62,8 +62,19 @@ export function coerceGateShape(raw: unknown): Gate | null {
     if (Object.keys(sessions).length > 0) gate.remindedSessions = sessions
   }
   if (Array.isArray(r.failedSessions)) {
-    const sessions = r.failedSessions.filter((x): x is string => typeof x === "string")
-    if (sessions.length > 0) gate.failedSessions = sessions
+    // Legacy shape (string[]) — convert with fresh timestamps
+    const sessions: Record<string, number> = {}
+    const now = Date.now()
+    for (const session of r.failedSessions) {
+      if (typeof session === "string") sessions[session] = now
+    }
+    if (Object.keys(sessions).length > 0) gate.failedSessions = sessions
+  } else if (r.failedSessions !== null && typeof r.failedSessions === "object") {
+    const sessions: Record<string, number> = {}
+    for (const [session, at] of Object.entries(r.failedSessions as Record<string, unknown>)) {
+      if (typeof at === "number" && Number.isFinite(at)) sessions[session] = at
+    }
+    if (Object.keys(sessions).length > 0) gate.failedSessions = sessions
   }
   return gate
 }
@@ -96,7 +107,12 @@ export function repairGate(gate: Gate): boolean {
     changed = true
   }
   if (gate.correction !== undefined) {
-    const correction = scrubSecrets(gate.correction)
+    let correction = scrubSecrets(gate.correction)
+    if (correction.length > SNIPPET_MAX) {
+      // Unbounded corrections are a context-pollution vector; the companion
+      // skill mandates one actionable line anyway.
+      correction = correction.slice(0, SNIPPET_MAX)
+    }
     if (correction !== gate.correction) {
       gate.correction = correction
       changed = true
@@ -123,11 +139,23 @@ export function repairGate(gate: Gate): boolean {
     if (Object.keys(reminded).length === 0) delete gate.remindedSessions
   }
   if (gate.failedSessions !== undefined) {
-    if (gate.failedSessions.length > SESSION_STATE_CAP) {
-      gate.failedSessions = gate.failedSessions.slice(-SESSION_STATE_CAP)
+    const now = Date.now()
+    const failed = gate.failedSessions
+    for (const session of Object.keys(failed)) {
+      if (now - (failed[session] ?? 0) > SESSION_STATE_TTL_MS) {
+        delete failed[session]
+        changed = true
+      }
+    }
+    const sessions = Object.keys(failed)
+    if (sessions.length > SESSION_STATE_CAP) {
+      sessions.sort((a, b) => (failed[a] ?? 0) - (failed[b] ?? 0))
+      for (const session of sessions.slice(0, sessions.length - SESSION_STATE_CAP)) {
+        delete failed[session]
+      }
       changed = true
     }
-    if (gate.failedSessions.length === 0) delete gate.failedSessions
+    if (Object.keys(failed).length === 0) delete gate.failedSessions
   }
   // Policy is the single source of truth: a blocking gate that cannot block
   // is a leftover from an older policy and must be demoted.

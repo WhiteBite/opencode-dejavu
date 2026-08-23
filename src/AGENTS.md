@@ -31,6 +31,9 @@ Two dependency-free modules: `patterns.ts` (pure functions — call identity, no
 - Lock order is always project → global, gates → index (see `recordFailure` escalation) — reversing deadlocks; the log lock is separate and leaf-level
 - Cross-project evidence lives ONLY in the global `index.json` — a gate's own `projects` array sees one store and never drives escalation alone
 - Escalation writes the global gate FIRST, then removes the project copy — a crash between the two writes must leave a duplicate (healed by migrate), never a hole
+- `mergeGate` preserves session enforcement state (`remindedSessions`/`failedSessions`) — merging must never reset the remind→block chain
+- Fuzzy consolidation in `recordFailure` prefers the gate holding the session's reminded state (before/after hooks must stay in sync) and never overwrites the evidence snippet
+- Snippets and corrections are UNTRUSTED text re-injected into agent context — keep the data-label framing in messages, the 200-char correction bound, and scrub quarantine bytes
 - Inside `runLocked` always `load(true)`; unlocked `load()` peeks are routing hints only, never a basis for mutation
 - Hot-path reads use the 1s TTL cache + key index (`byKey`/`blockingOnly`); mutations inside locks use `load(true)`; `save()` refreshes the cache directly
 - The remind→block chain is persisted ON THE GATE (`remindedSessions`/`failedSessions`) and enforced under the store lock — process memory holds nothing authoritative, so several windows and restarts share one escalation

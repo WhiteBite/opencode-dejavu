@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.3.1 — 2026-08-24
+
+### Fixed (adversarial + security review round)
+- `mergeGate` now merges `remindedSessions`/`failedSessions` — escalation and dedupe no longer silently reset the remind→block chain.
+- Fuzzy consolidation prefers the gate the session was already reminded about, keeping before/after hooks in sync when two blocking gates are near-duplicates; fuzzy merges no longer overwrite a gate's evidence snippet (a crafted near-duplicate cannot poison it).
+- Quarantine resets the hot-path caches — no phantom gates served after a corrupt `gates.json` is quarantined.
+- `failedSessions` became `sessionID -> timestamp` with the same 24h TTL as reminders — a stale block with no live session is a leak, not enforcement (legacy array shape coerces on load).
+
+### Hardened
+- Prompt-injection framing: snippets and corrections are labeled in remind/block/compaction messages as data/guidance, not instructions; corrections are truncated to 200 chars (context-pollution bound, enforced mechanically).
+- Quarantined files and excised log lines are secret-scrubbed before being preserved.
+- Overrides (`dejavu:proceed`) also emit a `warn`-level client log — mass-overriding must be noticeable.
+- Store size bound: past 2000 gates the weakest watching gate is evicted (flood guard).
+- `scrubSecrets` adds Hugging Face / DigitalOcean / Vercel / New Relic / SendGrid shapes and generic `key=<long value>` assignments (incl. lowercase keys).
+
 ## 2.3.0 — 2026-08-24
 
 ### Multi-process hardening (several OpenCode windows = several plugin processes on one store)

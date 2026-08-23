@@ -6,8 +6,8 @@ import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Dejavu } from "../index"
-import { callSignature, canBlock, fuzzySimilar, parameterizeError, scrubSecrets, splitChain } from "../src/patterns"
-import { GateStore, Stores } from "../src/store"
+import { callSignature, canBlock, fuzzySimilar, parameterizeError, patternKey, scrubSecrets, splitChain } from "../src/patterns"
+import { GateStore, Stores, mergeGate, type Gate } from "../src/store"
 
 type Ctx = Parameters<typeof Dejavu>[0]
 type Hooks = Awaited<ReturnType<typeof Dejavu>>
@@ -30,6 +30,9 @@ interface GateRow {
   snippet: string
   firstSeen: string
   lastSeen: string
+  correction?: string
+  remindedSessions?: Record<string, number>
+  failedSessions?: Record<string, number>
 }
 
 let failures = 0
@@ -590,6 +593,106 @@ check(
   "over-long signatures never fuzzy-match (exact only)",
   !fuzzySimilar(`bash:${"x".repeat(320)}`, `bash:${"x".repeat(320)} tail`),
 )
+
+// --- seeded-store helpers for the state-machine tests below ---
+const seedGate = (over: Record<string, unknown>): Record<string, unknown> => ({
+  key: "000000000000",
+  signature: "bash:placeholder",
+  tool: "bash",
+  status: "blocking",
+  count: 3,
+  sessions: ["s1", "s2"],
+  projects: [],
+  firstSeen: "2026-08-20T00:00:00.000Z",
+  lastSeen: "2026-08-23T00:00:00.000Z",
+  snippet: "exit code 1",
+  remindedCount: 0,
+  blockedCount: 0,
+  recurredAfterReminder: 0,
+  recurredAfterGate: 0,
+  ...over,
+})
+const seedGates = async (dir: string, gates: Record<string, unknown>[]): Promise<void> => {
+  const dejavuDir = join(dir, ".opencode", "dejavu")
+  await mkdir(dejavuDir, { recursive: true })
+  await writeFile(join(dejavuDir, "gates.json"), JSON.stringify({ version: 1, gates }), "utf8")
+}
+const failOn = (hooks: Awaited<ReturnType<typeof Dejavu>>) => async (command: string, session: string, callID: string): Promise<void> => {
+  await (hooks["tool.execute.after"] as AfterHook)(
+    { tool: "bash", sessionID: session, callID, args: { command } } as unknown as AfterInput,
+    { title: command, output: "npm ERR! boom\nExit code: 1", metadata: {} } as unknown as AfterOutput,
+  )
+}
+const attemptWith = (hooks: Awaited<ReturnType<typeof Dejavu>>) => async (command: string, session: string, callID: string): Promise<Error | null> => {
+  try {
+    await (hooks["tool.execute.before"] as BeforeHook)({ tool: "bash", sessionID: session, callID } as unknown as BeforeInput, { args: { command } } as unknown as BeforeOutput)
+    return null
+  } catch (error) {
+    return error as Error
+  }
+}
+
+// --- 28. mergeGate preserves session enforcement state (escalation must not reset it) ---
+const mergeA = seedGate({ key: "aaaa11111111", remindedSessions: { s1: 100, s2: 200 }, failedSessions: { s1: 150 } }) as unknown as Gate
+const mergeB = seedGate({ key: "aaaa11111111", remindedSessions: { s2: 300, s3: 250 }, failedSessions: { s3: 260 } }) as unknown as Gate
+mergeGate(mergeA, mergeB)
+check(
+  "mergeGate preserves session enforcement state",
+  mergeA.remindedSessions?.s1 === 100 &&
+    mergeA.remindedSessions?.s2 === 300 &&
+    mergeA.remindedSessions?.s3 === 250 &&
+    mergeA.failedSessions?.s1 === 150 &&
+    mergeA.failedSessions?.s3 === 260,
+)
+
+// --- 29. fuzzy consolidation lands on the reminded gate and keeps its evidence ---
+const fuzzyDir = join(tmp, "fuzzy-project")
+const sigA = callSignature("bash", { command: "deploy --to alpha" }) ?? ""
+const sigB = callSignature("bash", { command: "deploy --to beta" }) ?? ""
+await seedGates(fuzzyDir, [
+  seedGate({ key: patternKey(sigA), signature: sigA, snippet: "EVIDENCE-A" }),
+  seedGate({ key: patternKey(sigB), signature: sigB, snippet: "EVIDENCE-B", remindedSessions: { "fuzzy-ses": Date.now() } }),
+])
+const hooksF = await Dejavu({ directory: fuzzyDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+await failOn(hooksF)("deploy --to gamma", "fuzzy-ses", "fz1")
+const fuzzyGates = await readJson(join(fuzzyDir, ".opencode", "dejavu", "gates.json"))
+const gateFA = fuzzyGates.find((g) => g.key === patternKey(sigA))
+const gateFB = fuzzyGates.find((g) => g.key === patternKey(sigB))
+check("failure lands on the reminded gate (before/after hooks stay in sync)", gateFA?.count === 3 && gateFB?.count === 4)
+check("fuzzy consolidation does not overwrite evidence", gateFB?.snippet === "EVIDENCE-B")
+check("failure after reminder escalates to failedSessions", gateFB?.failedSessions?.["fuzzy-ses"] !== undefined)
+
+// --- 30. failedSessions expire; legacy arrays coerce ---
+const ttlDir = join(tmp, "ttl-project")
+const ttlSig = callSignature("bash", { command: "stale block cmd" }) ?? ""
+await seedGates(ttlDir, [
+  seedGate({
+    key: patternKey(ttlSig),
+    signature: ttlSig,
+    failedSessions: { "stale-ses": Date.now() - 2 * 24 * 60 * 60 * 1000, "fresh-ses": Date.now() },
+  }),
+])
+const hooksT = await Dejavu({ directory: ttlDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+const staleRes = await attemptWith(hooksT)("stale block cmd", "stale-ses", "t1")
+check("stale failedSession expired — no permanent block", staleRes !== null && staleRes.message.includes("[dejavu] REMINDER"))
+const freshRes = await attemptWith(hooksT)("stale block cmd", "fresh-ses", "t2")
+check("fresh failedSession still blocks", freshRes !== null && freshRes.message.includes("[dejavu] BLOCKED"))
+
+const legacyDir = join(tmp, "legacy-project")
+const legacySig = callSignature("bash", { command: "legacy block cmd" }) ?? ""
+await seedGates(legacyDir, [seedGate({ key: patternKey(legacySig), signature: legacySig, failedSessions: ["legacy-ses"] })])
+const hooksL = await Dejavu({ directory: legacyDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+const legacyRes = await attemptWith(hooksL)("legacy block cmd", "legacy-ses", "l1")
+check("legacy failedSessions array coerces and still blocks", legacyRes !== null && legacyRes.message.includes("[dejavu] BLOCKED"))
+
+// --- 31. corrections are truncated (context-pollution bound) ---
+const corrDir = join(tmp, "corr-project")
+const corrSig = callSignature("bash", { command: "corrected cmd" }) ?? ""
+await seedGates(corrDir, [seedGate({ key: patternKey(corrSig), signature: corrSig, correction: "x".repeat(300) })])
+const hooksC = await Dejavu({ directory: corrDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+await failOn(hooksC)("corrected cmd", "c1", "c2")
+const corrGates = await readJson(join(corrDir, ".opencode", "dejavu", "gates.json"))
+check("correction truncated to the evidence bound", (corrGates.find((g) => g.key === patternKey(corrSig))?.correction ?? "").length <= 200)
 
 await rm(tmp, { recursive: true, force: true })
 
