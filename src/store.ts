@@ -4,7 +4,7 @@ import { canBlock, fuzzySimilar, FUZZY_MAX_LEN, scrubSecrets } from "./patterns"
 import { coerceGateShape, repairGate } from "./validate"
 
 /** Bumped on behavior changes; stamped into init log events so stale sessions are visible. */
-export const PLUGIN_VERSION = "2.3.1"
+export const PLUGIN_VERSION = "2.4.0"
 
 export interface Gate {
   /** sha1 signature prefix — the pattern identity */
@@ -71,6 +71,7 @@ export type LogEventType =
   | "repaired"
   | "quarantined"
   | "degraded"
+  | "retired-healed"
 
 export interface LogEvent {
   type: LogEventType
@@ -350,13 +351,23 @@ export class GateStore {
     })
   }
 
-  /** Caller must hold the lock. */
-  async expire(ttlDays: number): Promise<Gate[]> {
+  /**
+   * Caller must hold the lock. Weak one-off patterns (below the promotion
+   * threshold, never enforced) rot faster than proven ones — a pattern that
+   * never recurred enough to matter is noise, not memory.
+   */
+  async expire(ttlDays: number, noiseTtlDays: number): Promise<Gate[]> {
     const gates = await this.load(true)
-    const cutoff = Date.now() - ttlDays * DAY_MS
-    const expired = gates.filter((g) => Date.parse(g.lastSeen) < cutoff)
+    const now = Date.now()
+    const expired = gates.filter((g) => {
+      const ttl = g.status === "blocking" || g.count >= PROMOTE_COUNT ? ttlDays : noiseTtlDays
+      return Date.parse(g.lastSeen) < now - ttl * DAY_MS
+    })
     if (expired.length === 0) return []
-    this.gates = gates.filter((g) => Date.parse(g.lastSeen) >= cutoff)
+    const expiredKeys = new Set(expired.map((g) => g.key))
+    this.gates = gates.filter((g) => !expiredKeys.has(g.key))
+    this.keyIndex = null
+    this.blockingCache = null
     await this.save()
     return expired
   }
@@ -596,12 +607,19 @@ export class Stores {
     }
   }
 
-  async expireAll(ttlDays: number): Promise<void> {
+  async expireAll(ttlDays: number, noiseTtlDays: number): Promise<void> {
     for (const store of this.scopes()) {
       await store.runLocked(async () => {
-        const expired = await store.expire(ttlDays)
+        const expired = await store.expire(ttlDays, noiseTtlDays)
         for (const gate of expired) {
-          await store.log({ type: "expired", key: gate.key, tool: gate.tool })
+          // Correction lifecycle: a corrected gate that never recurred after
+          // promotion means the pattern died out — the mechanical signal that
+          // the teaching worked.
+          if (gate.correction !== undefined && gate.recurredAfterGate === 0) {
+            await store.log({ type: "retired-healed", key: gate.key, tool: gate.tool, snippet: gate.correction.slice(0, 200) })
+          } else {
+            await store.log({ type: "expired", key: gate.key, tool: gate.tool })
+          }
         }
       })
     }

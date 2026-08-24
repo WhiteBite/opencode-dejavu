@@ -19,6 +19,8 @@ import { GateStore, Stores, type Gate, PLUGIN_VERSION } from "./src/store"
 const GLOBAL_PROJECTS = 2
 /** gates expire when the pattern has not recurred for this many days */
 const TTL_DAYS = 60
+/** weak one-off patterns (below promotion threshold, never enforced) rot this fast */
+const NOISE_TTL_DAYS = 7
 /** how often a long-lived process re-runs expiry */
 const TTL_INTERVAL_MS = 6 * 60 * 60 * 1000
 /** a gate firing this often without killing the error gets flagged for review */
@@ -91,7 +93,7 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
   try {
     await stores.reconcileAll(GLOBAL_PROJECTS)
     await stores.migrate()
-    await stores.expireAll(TTL_DAYS)
+    await stores.expireAll(TTL_DAYS, NOISE_TTL_DAYS)
     await stores.rotateLogs()
     await stores.logAll({ type: "init", key: "dejavu", version: PLUGIN_VERSION })
     await logClient("info", `dejavu initialized v${PLUGIN_VERSION}`)
@@ -104,7 +106,7 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
   // Long-lived processes re-run expiry periodically.
   const ttlTimer = setInterval(() => {
     // expiry is best-effort; the timer keeps running regardless
-    stores.expireAll(TTL_DAYS).catch(() => {})
+    stores.expireAll(TTL_DAYS, NOISE_TTL_DAYS).catch(() => {})
   }, TTL_INTERVAL_MS)
   ;(ttlTimer as { unref?: () => void }).unref?.()
 

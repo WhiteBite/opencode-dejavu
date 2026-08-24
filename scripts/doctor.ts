@@ -147,6 +147,12 @@ for (const scope of scopes) {
     for (const g of notTeaching.slice(0, 10)) console.log(`     - recurred ${g.recurredAfterGate} | ${g.signature}`)
   }
 
+  // Positive signal: correction exists and the pattern never recurred after promotion
+  const teaching = gates.filter((g) => g.correction !== undefined && g.recurredAfterGate === 0 && g.count >= 3)
+  if (teaching.length > 0) {
+    console.log(`   note: TEACHING (${teaching.length}) — corrected gates with zero recurrences after promotion`)
+  }
+
   const annoying = gates.filter((g) => g.remindedCount >= 10 && canBlock(g.tool, g.signature))
   if (annoying.length > 0) {
     issues += annoying.length

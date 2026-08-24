@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.4.0 — 2026-08-24
+
+### Added
+- Noise TTL: weak one-off patterns (below the promotion threshold, never enforced) expire after 7 days instead of 60 — memory is for recurring mistakes, not one-shot noise.
+- Correction lifecycle signal: an expired gate that had a correction and zero recurrences after promotion logs `retired-healed` — the mechanical "the teaching worked"; doctor reports such gates as TEACHING.
+
+### Notes
+- V2 plugin API migration awaits upstream: `tool.execute.error` (opencode issue #27900) is drafted but unmerged — the event-stream scan remains the file-tool failure channel until then.
+
 ## 2.3.1 — 2026-08-24
 
 ### Fixed (adversarial + security review round)

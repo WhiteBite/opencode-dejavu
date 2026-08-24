@@ -112,11 +112,11 @@ bun run typecheck        # tsc --noEmit (index.ts + src/**)
 bun test/smoke.ts        # behavioral smoke test, no framework needed
 ```
 
-Tunables are named constants at the top of `index.ts` and `src/store.ts`: `PROMOTE_COUNT` (3), `PROMOTE_COUNT_PROBE` (5), `PROMOTE_SESSIONS` (2), `GLOBAL_PROJECTS` (2), `TTL_DAYS` (60), `REVIEW_FIRES` (10).
+Tunables are named constants at the top of `index.ts` and `src/store.ts`: `PROMOTE_COUNT` (3), `PROMOTE_COUNT_PROBE` (5), `PROMOTE_SESSIONS` (2), `GLOBAL_PROJECTS` (2), `TTL_DAYS` (60), `NOISE_TTL_DAYS` (7), `REVIEW_FIRES` (10), `MAX_GATES` (2000).
 
 ## Roadmap
 
-- v2: recurrence-after-gate reporting command; V2 plugin API error hooks when stable
+- v2: recurrence-after-gate reporting command; V2 plugin API error hooks — `tool.execute.error` is drafted upstream (opencode issue #27900) but unmerged; the event-stream scan remains the file-tool failure channel until it lands
 - v3: auto-proposal of ast-grep rules for statically detectable patterns (repo-level CI gates)
 
 ## License

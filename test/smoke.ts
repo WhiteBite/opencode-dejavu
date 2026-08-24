@@ -694,6 +694,31 @@ await failOn(hooksC)("corrected cmd", "c1", "c2")
 const corrGates = await readJson(join(corrDir, ".opencode", "dejavu", "gates.json"))
 check("correction truncated to the evidence bound", (corrGates.find((g) => g.key === patternKey(corrSig))?.correction ?? "").length <= 200)
 
+// --- 32. noise TTL: weak one-off patterns rot fast, proven ones persist ---
+const noiseDir = join(tmp, "noise-project")
+const weakSig = callSignature("bash", { command: "weak one-off cmd" }) ?? ""
+const strongSig = callSignature("bash", { command: "strong proven cmd" }) ?? ""
+const eightDaysAgo = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString()
+await seedGates(noiseDir, [
+  seedGate({ key: patternKey(weakSig), signature: weakSig, count: 1, sessions: ["n1"], status: "watching", firstSeen: eightDaysAgo, lastSeen: eightDaysAgo }),
+  seedGate({ key: patternKey(strongSig), signature: strongSig, count: 3, firstSeen: eightDaysAgo, lastSeen: eightDaysAgo }),
+])
+await Dejavu({ directory: noiseDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+const noiseGates = await readJson(join(noiseDir, ".opencode", "dejavu", "gates.json"))
+check("weak one-off gate rots on the noise TTL", !noiseGates.some((g) => g.key === patternKey(weakSig)))
+check("proven gate survives the noise TTL", noiseGates.some((g) => g.key === patternKey(strongSig)))
+
+// --- 33. correction lifecycle: corrected gate with zero recurrences retires healed ---
+const healRetireDir = join(tmp, "heal-retire-project")
+const healSig = callSignature("bash", { command: "healed cmd" }) ?? ""
+const sixtyOneDaysAgo = new Date(Date.now() - 61 * 24 * 60 * 60 * 1000).toISOString()
+await seedGates(healRetireDir, [
+  seedGate({ key: patternKey(healSig), signature: healSig, count: 5, correction: "use the other flag", lastSeen: sixtyOneDaysAgo, firstSeen: sixtyOneDaysAgo }),
+])
+await Dejavu({ directory: healRetireDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+const healLog = await readFile(join(healRetireDir, ".opencode", "dejavu", "log.jsonl"), "utf8")
+check("corrected gate with zero recurrences retires healed", healLog.includes('"type":"retired-healed"'))
+
 await rm(tmp, { recursive: true, force: true })
 
 if (failures > 0) {
