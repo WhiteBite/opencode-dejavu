@@ -31,7 +31,7 @@ dejavu-opencode-plugin/
 | Gate enforcement (remind/block/override) | `index.ts` `tool.execute.before` | session state lives ON THE GATE (`remindedSessions`/`failedSessions`), read fresh under the store lock |
 | Failure detection + recording | `index.ts` `tool.execute.after` + `event` | two channels: exit/text vs message stream |
 | Signature/normalization | `src/patterns.ts` | `callSignature`, `normalizeCommand`, `parameterizeError` |
-| Blocking policy | `src/patterns.ts:canBlock()` | single source of truth — bash non-diagnostics, no bare `-c <str>` shapes |
+| Enforcement policy | `src/patterns.ts:canBlock()`/`canRemind()` | three tiers — bash non-diagnostics block, diagnostics remind-only, everything else just watches |
 | Persistence, locks, promotion, global escalation | `src/store.ts` | `Stores.recordFailure()` is the core; cross-project evidence lives in global `index.json` |
 | Self-healing / reconcile | `src/store.ts` + `src/validate.ts` | `Stores.reconcileAll()` at every init; `doctor --repair` on demand |
 | Tunables | top of `index.ts` **and** `src/store.ts` | split: TTL/review caps in index, promote thresholds in store |
@@ -45,7 +45,8 @@ dejavu-opencode-plugin/
 | `GateSignal` | class | index.ts:37 | sentinel error — the ONLY error rethrown from hooks |
 | `callSignature` | fn | src/patterns.ts:272 | stable call identity per tool (bash/read/edit/write/glob/grep) |
 | `patternKey` | fn | src/patterns.ts:300 | sha1 prefix-12 of signature — the gate key |
-| `canBlock` | fn | src/patterns.ts:178 | blocking policy gate |
+| `canBlock` | fn | src/patterns.ts:184 | blocking policy gate |
+| `canRemind` / `isRepoLocal` | fn | src/patterns.ts:197/215 | remind-only tier (diagnostics) / repo-local verbs that never escalate globally |
 | `normalizeCommand` | fn | src/patterns.ts:80 | bash → signature; fingerprints interpreter one-liner payloads |
 | `hashInterpreterPayload` | fn | src/patterns.ts:56 | `-c`/`-e` code payload → `<code:hash>` (identity of one-liners) |
 | `fuzzySimilar` | fn | src/patterns.ts:349 | near-duplicate merge; length-band pre-filter + `FUZZY_MAX_LEN` cap |
@@ -76,14 +77,15 @@ dejavu-opencode-plugin/
 - Do NOT flatten interpreter one-liner payloads (`python -c`, `node -e`) to `<str>` — the code IS the call; `hashInterpreterPayload` fingerprints it so distinct scripts never share a gate
 - Do NOT persist anything before `scrubSecrets()` — signatures, snippets, args, error text, logs
 - Do NOT throw from hooks except `GateSignal` — plugin bugs must never break the tool pipeline
-- Do NOT let file-probe or diagnostic tools reach `blocking` status — `canBlock()` is the single source of truth; `migrate()` auto-demotes violations
+- Do NOT let file-probe or diagnostic tools reach `blocking` status — `canBlock()` is the single source of truth; `migrate()` auto-demotes violations (diagnostics land in `reminding`, never `blocking`)
 - Do NOT create gates manually — promotion is mechanical (3 failures × 2 sessions)
 - Do NOT delete quarantine files (`gates.json.corrupt-*`, `log.jsonl.corrupt`) without inspection — they are the preserved forensic bytes of corrupted data
 - Do NOT bypass the validation boundary — gates enter memory through `coerceGateShape`/`repairGate` (in `load()`) and structural healing through `reconcile()`; never hand-roll raw JSON reads/writes of store files
 
 ## UNIQUE STYLES
 
-- Two-scope store: project gates in `<repo>/.opencode/dejavu/` (committable) escalate to global `~/.config/opencode/dejavu/` after appearing in 2+ project dirs (agent habits vs repo quirks)
+- Two-scope store: project gates in `<repo>/.opencode/dejavu/` (committable) escalate to global `~/.config/opencode/dejavu/` after appearing in 2+ project dirs (agent habits vs repo quirks) — except repo-local verbs (npm/git/gradle/docker/...), which are repo quirks by nature and stay project-scoped forever
+- Three enforcement tiers: `blocking` (remind, then hard-block on same-session repeat), `reminding` (diagnostics — signal without punishing iteration), `watching` (evidence only); `fuzzySimilar` never merges disjoint flag sets but allows subset additions
 - Self-healing stores: every init runs `reconcileAll()` — unparseable files are quarantined (bytes preserved in `*.corrupt-*`, never deleted), records are strictly parsed + mechanically repaired, index is reconciled, and every repair is logged (`repaired`/`quarantined` events); `doctor --repair` does the same on demand — one command replaces hand-debugging
 - Multi-window safe: the remind→block chain is persisted on the gate, not in process memory — several OpenCode windows (each its own process on the shared store) and process restarts all see the same escalation; hot-path reads use a 1s TTL cache + O(1) key index
 - `dejavu:proceed` escape hatch: trailing marker comment, matched with word boundaries, stripped before normalization so bypassed failures land on the original pattern

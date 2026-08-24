@@ -187,6 +187,37 @@ export function canBlock(tool: string, signature: string): boolean {
   return !GENERIC_ONELINER_SHAPE.test(signature)
 }
 
+/**
+ * Remind-only policy: diagnostic bash commands still surface a REMINDER when
+ * they recur (the old behavior gave them zero signal), but they NEVER block —
+ * blocking a test/lint the agent is iterating on punishes normal work.
+ * Generic one-liner shapes stay unenforced: they are too broad to remind on.
+ */
+export function canRemind(tool: string, signature: string): boolean {
+  if (tool !== "bash") return false
+  if (GENERIC_ONELINER_SHAPE.test(signature)) return false
+  return isDiagnosticSignature(signature)
+}
+
+/**
+ * Repo-local verbs: their success depends on THIS repo's state (deps, lockfile,
+ * remote, build cache), not on agent behavior — so a failure is a repo quirk,
+ * not an agent habit, and must never escalate to the global store (an
+ * `npm install` that broke in project A would otherwise block project B).
+ */
+const REPO_LOCAL_VERBS: RegExp[] = [
+  /\b(npm|yarn|pnpm|bun|npx)\b/i,
+  /\bgit\b/i,
+  /\b(gradlew|gradle|mvn|maven)\b/i,
+  /\b(cargo|go|pip3?|poetry|uv)\b/i,
+  /\bdocker(-compose)?\b/i,
+  /\b(make|cmake|bazel)\b/i,
+]
+
+export function isRepoLocal(signature: string): boolean {
+  return REPO_LOCAL_VERBS.some((rule) => rule.test(signature))
+}
+
 // --- Chain splitting ---------------------------------------------------------
 
 /**
@@ -338,6 +369,23 @@ export function levenshtein(a: string, b: string): number {
 /** Code fingerprints are IDENTITY, not data — they must match exactly. */
 const CODE_FINGERPRINTS = /<code:[0-9a-f]+>/g
 
+/** Flag tokens ("-x", "--foo") are the operation's switches. Two commands with
+ * DISJOINT flag sets are different operations and must never fuzzy-merge
+ * ("train --lr <n>" vs "train --epochs <n>"). A subset IS allowed — extra
+ * switches on the same operation ("gradlew test --no-daemon") still belong to
+ * the same gate, otherwise enforcement fragments across harmless variants. */
+function flagTokens(signature: string): string[] {
+  return signature
+    .split(/\s+/)
+    .filter((token) => token.startsWith("-"))
+    .sort()
+}
+
+function flagSubset(a: string[], b: string[]): boolean {
+  const set = new Set(b)
+  return a.every((token) => set.has(token))
+}
+
 /** Signatures longer than this match exactly only: a 300-char normalized
  * command is already specific enough that "30% near" is meaningless, and
  * Levenshtein on long signatures is the hot-path cost cliff. */
@@ -350,7 +398,9 @@ export const FUZZY_MAX_LEN = 300
  * commands ("git push <str>" vs "git pull <str>" = distance 2) from merging.
  * Signatures carrying <code:...> fingerprints only match if the fingerprints
  * are identical — random hashes differing in 3 chars would otherwise pass the
- * distance rule and merge unrelated one-liners into one gate.
+ * distance rule and merge unrelated one-liners into one gate. Flag sets must
+ * also be comparable (one a subset of the other) — disjoint switches mean
+ * different operations.
  */
 export function fuzzySimilar(a: string, b: string): boolean {
   if (a === b) return true
@@ -359,6 +409,9 @@ export function fuzzySimilar(a: string, b: string): boolean {
   if (codesA !== null || codesB !== null) {
     if (codesA === null || codesB === null || codesA.join("\u0000") !== codesB.join("\u0000")) return false
   }
+  const flagsA = flagTokens(a)
+  const flagsB = flagTokens(b)
+  if (!flagSubset(flagsA, flagsB) && !flagSubset(flagsB, flagsA)) return false
   const maxLen = Math.max(a.length, b.length)
   if (maxLen === 0) return true
   if (maxLen > FUZZY_MAX_LEN) return false

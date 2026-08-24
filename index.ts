@@ -129,7 +129,7 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
         for (let i = 0; i < candidates.length; i++) {
           const sig = candidates[i] ?? ""
           const match = await stores.findGate(patternKey(sig), sig)
-          if (match && match.gate.status === "blocking") {
+          if (match && match.gate.status !== "watching") {
             found = { gate: match.gate, store: match.store, via: i > 0 && match.via === "exact" ? "segment" : match.via }
             break
           }
@@ -182,7 +182,9 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
           if (fresh === undefined) return // gate deleted between find and lock
 
           // Repeat offense: reminded, retried, failed again -> hard block.
-          if (fresh.failedSessions !== undefined && fresh.failedSessions[session] !== undefined) {
+          // Remind-only gates (diagnostics) never reach this branch — they
+          // never collect failedSessions (see the after-hook).
+          if (fresh.status === "blocking" && fresh.failedSessions !== undefined && fresh.failedSessions[session] !== undefined) {
             fresh.blockedCount += 1
             if (fresh.blockedCount >= REVIEW_FIRES) fresh.review = true
             await target.store.save()
@@ -302,13 +304,15 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
           let changed = false
           // Metric: failure of an already-enforced pattern (the event that
           // promoted the gate does not count — the gate did not exist yet).
-          if (fresh.status === "blocking" && !result.promoted) {
+          if (fresh.status !== "watching" && !result.promoted) {
             fresh.recurredAfterGate += 1
             changed = true
             await stores.logAll({ type: "recurred-after-gate", key: fresh.key, tool: input.tool, session, project: directory })
           }
           // Same-session repeat after a reminder -> escalate to hard block.
-          if (fresh.remindedSessions?.[session] !== undefined) {
+          // Remind-only gates (diagnostics) never collect failedSessions:
+          // they signal but must not punish iterating on tests/linters.
+          if (fresh.status === "blocking" && fresh.remindedSessions?.[session] !== undefined) {
             if (fresh.failedSessions === undefined) fresh.failedSessions = {}
             fresh.failedSessions[session] = Date.now()
             fresh.recurredAfterReminder += 1
@@ -410,7 +414,7 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
 
     "experimental.session.compacting": async (_input, output) => {
       try {
-        const gates = await stores.blockingGates()
+        const gates = await stores.enforcedGates()
         if (gates.length === 0) return
         const lines = gates
           .slice(0, 20)

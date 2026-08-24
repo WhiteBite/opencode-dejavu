@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.5.0 — 2026-08-24
+
+### Changed (the three known gaps, closed)
+- **Diagnostics now signal.** Recurring test/lint/build-check failures (`tsc`, `pytest`, `curl`, ...) previously got zero enforcement. New gate tier `reminding`: they promote and REMIND like any gate, but NEVER block — a new status alongside `watching`/`blocking`, enforced everywhere (findGate, compaction, migrate/repair, doctor, TTL).
+- **Repo-local verbs never escalate.** npm/yarn/pnpm/bun/npx, git, gradle/maven, cargo/go/pip/poetry/uv, docker, make/cmake/bazel failures are repo quirks, not agent habits — they stay project-scoped forever (`isRepoLocal`), so a broken `npm install` in one project can no longer block another. Doctor's MISSED-ESCALATION skips them.
+- **Flag-aware fuzzy matching.** Commands with disjoint flag sets never merge (`train --lr` vs `train --epochs`); subset additions still do (`train` vs `train -v`), so enforcement doesn't fragment across harmless variants while different operations stay separate.
+
+### Migration
+- `migrate()` re-tiers legacy gates: over-blocking diagnostics → `reminding` (signal kept), and already-proven recurring diagnostics → `reminding` immediately (no waiting for the next failure).
+
 ## 2.4.0 — 2026-08-24
 
 ### Added

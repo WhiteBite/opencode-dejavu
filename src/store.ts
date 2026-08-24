@@ -1,10 +1,10 @@
 import { appendFile, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
-import { canBlock, fuzzySimilar, FUZZY_MAX_LEN, scrubSecrets } from "./patterns"
+import { canBlock, canRemind, fuzzySimilar, FUZZY_MAX_LEN, isRepoLocal, scrubSecrets } from "./patterns"
 import { coerceGateShape, repairGate } from "./validate"
 
 /** Bumped on behavior changes; stamped into init log events so stale sessions are visible. */
-export const PLUGIN_VERSION = "2.4.0"
+export const PLUGIN_VERSION = "2.5.0"
 
 export interface Gate {
   /** sha1 signature prefix — the pattern identity */
@@ -12,8 +12,9 @@ export interface Gate {
   /** normalized call signature, e.g. "bash:npm install --legacy-peer-deps" */
   signature: string
   tool: string
-  /** watching = collecting evidence; blocking = gate is enforced */
-  status: "watching" | "blocking"
+  /** watching = collecting evidence; reminding = enforced as reminder only
+   * (diagnostics — never block); blocking = reminder + hard block on repeat */
+  status: "watching" | "reminding" | "blocking"
   count: number
   /** distinct session IDs where the failure was seen */
   sessions: string[]
@@ -199,7 +200,7 @@ export class GateStore {
   /** hot-path caches: valid until LOAD_CACHE_TTL_MS / invalidated on mutation */
   private cacheUntilMs = 0
   private keyIndex: Map<string, Gate> | null = null
-  private blockingCache: Gate[] | null = null
+  private enforcedCache: Gate[] | null = null
   private index: IndexFile | null = null
   private indexMtimeMs = 0
 
@@ -254,7 +255,7 @@ export class GateStore {
       }
       this.gates = gates
       this.keyIndex = new Map(gates.map((g) => [g.key, g]))
-      this.blockingCache = gates.filter((g) => g.status === "blocking")
+      this.enforcedCache = gates.filter((g) => g.status !== "watching")
       this.mtimeMs = info.mtimeMs
       this.cacheUntilMs = Date.now() + LOAD_CACHE_TTL_MS
       return this.gates
@@ -263,7 +264,7 @@ export class GateStore {
       if (this.gates === null) {
         this.gates = []
         this.keyIndex = new Map()
-        this.blockingCache = []
+        this.enforcedCache = []
       }
       this.cacheUntilMs = Date.now() + LOAD_CACHE_TTL_MS
       return this.gates
@@ -278,12 +279,12 @@ export class GateStore {
     return this.keyIndex.get(key)
   }
 
-  /** Cached blocking subset — the fuzzy scan iterates this, not all gates. */
-  blockingOnly(): Gate[] {
-    if (this.blockingCache === null) {
-      this.blockingCache = (this.gates ?? []).filter((g) => g.status === "blocking")
+  /** Cached enforced subset (blocking + reminding) — the fuzzy scan iterates this, not all gates. */
+  enforcedOnly(): Gate[] {
+    if (this.enforcedCache === null) {
+      this.enforcedCache = (this.gates ?? []).filter((g) => g.status !== "watching")
     }
-    return this.blockingCache
+    return this.enforcedCache
   }
 
   async save(): Promise<void> {
@@ -297,7 +298,7 @@ export class GateStore {
       // mtime refresh is best-effort
     }
     // We know the content we just wrote — refresh the TTL cache directly.
-    // (keyIndex/blockingCache hold references into this.gates, still valid.)
+    // (keyIndex/enforcedCache hold references into this.gates, still valid.)
     this.cacheUntilMs = Date.now() + LOAD_CACHE_TTL_MS
   }
 
@@ -360,14 +361,14 @@ export class GateStore {
     const gates = await this.load(true)
     const now = Date.now()
     const expired = gates.filter((g) => {
-      const ttl = g.status === "blocking" || g.count >= PROMOTE_COUNT ? ttlDays : noiseTtlDays
+      const ttl = g.status !== "watching" || g.count >= PROMOTE_COUNT ? ttlDays : noiseTtlDays
       return Date.parse(g.lastSeen) < now - ttl * DAY_MS
     })
     if (expired.length === 0) return []
     const expiredKeys = new Set(expired.map((g) => g.key))
     this.gates = gates.filter((g) => !expiredKeys.has(g.key))
     this.keyIndex = null
-    this.blockingCache = null
+    this.enforcedCache = null
     await this.save()
     return expired
   }
@@ -379,7 +380,7 @@ export class GateStore {
     if (removed.length > 0) {
       this.gates = this.gates.filter((g) => !keys.has(g.key))
       this.keyIndex = null
-      this.blockingCache = null
+      this.enforcedCache = null
     }
     return removed
   }
@@ -429,7 +430,7 @@ export class GateStore {
             await unlink(ntPath(this.gatesPath))
             this.gates = []
             this.keyIndex = null
-            this.blockingCache = null
+            this.enforcedCache = null
             this.mtimeMs = 0
             await this.save()
             await this.log({ type: "quarantined", key: "gates.json", snippet: `unparseable gates file quarantined (scrubbed) to ${quarantine}` })
@@ -582,7 +583,7 @@ export class Stores {
     if (signature.length > FUZZY_MAX_LEN) return null
     let best: { gate: Gate; store: GateStore; score: number } | null = null
     for (const store of this.scopes()) {
-      for (const gate of store.blockingOnly()) {
+      for (const gate of store.enforcedOnly()) {
         if (!fuzzySimilar(signature, gate.signature)) continue
         const score = Math.abs(signature.length - gate.signature.length)
         if (best === null || score < best.score) best = { gate, store, score }
@@ -591,12 +592,12 @@ export class Stores {
     return best === null ? null : { gate: best.gate, store: best.store, via: "fuzzy" }
   }
 
-  /** All currently enforced gates, project scope first, highest-count first. */
-  async blockingGates(): Promise<Gate[]> {
+  /** All currently enforced gates (blocking + reminding), project scope first, highest-count first. */
+  async enforcedGates(): Promise<Gate[]> {
     const result: Gate[] = []
     for (const store of this.scopes()) {
       await store.load()
-      for (const gate of store.blockingOnly()) result.push(gate)
+      for (const gate of store.enforcedOnly()) result.push(gate)
     }
     return result.sort((a, b) => b.count - a.count)
   }
@@ -681,8 +682,25 @@ export class Stores {
         const gates = await store.load(true)
         let changed = false
         for (const gate of gates) {
-          if (!canBlock(gate.tool, gate.signature) && gate.status === "blocking") {
+          if (gate.status === "blocking" && !canBlock(gate.tool, gate.signature)) {
+            // Over-blocking learned under an older policy: keep the signal if
+            // the shape can at least remind (diagnostics), else drop to watching.
+            gate.status = canRemind(gate.tool, gate.signature) ? "reminding" : "watching"
+            changed = true
+          }
+          if (gate.status === "reminding" && !canRemind(gate.tool, gate.signature)) {
             gate.status = "watching"
+            changed = true
+          }
+          if (
+            gate.status === "watching" &&
+            canRemind(gate.tool, gate.signature) &&
+            gate.count >= PROMOTE_COUNT &&
+            gate.sessions.length >= PROMOTE_SESSIONS
+          ) {
+            // Recurring diagnostics already proven under the old policy start
+            // reminding immediately instead of waiting for the next failure.
+            gate.status = "reminding"
             changed = true
           }
           const signature = scrubSecrets(gate.signature)
@@ -753,7 +771,7 @@ export class Stores {
       const index = await this.globalStore.loadIndex()
       const toEscalate = (await projectStore.load(true)).filter((g) => {
         const entry = index.keys[g.key]
-        return entry !== undefined && entry.projects.length >= globalProjects
+        return entry !== undefined && entry.projects.length >= globalProjects && !isRepoLocal(g.signature)
       })
       if (toEscalate.length > 0) {
         await projectStore.runLocked(async () => {
@@ -918,15 +936,16 @@ export class Stores {
 
       let promoted = false
       const threshold = PROBE_TOOLS.has(input.tool) ? PROMOTE_COUNT_PROBE : PROMOTE_COUNT
-      // Policy: only bash non-diagnostic commands may ever become gates.
-      if (
-        gate.status === "watching" &&
-        canBlock(gate.tool, gate.signature) &&
-        gate.count >= threshold &&
-        gate.sessions.length >= PROMOTE_SESSIONS
-      ) {
-        gate.status = "blocking"
-        promoted = true
+      // Policy: non-diagnostic bash may hard-block; diagnostics promote to
+      // remind-only (they never block — see canRemind). Everything else stays watching.
+      if (gate.status === "watching" && gate.count >= threshold && gate.sessions.length >= PROMOTE_SESSIONS) {
+        if (canBlock(gate.tool, gate.signature)) {
+          gate.status = "blocking"
+          promoted = true
+        } else if (canRemind(gate.tool, gate.signature)) {
+          gate.status = "reminding"
+          promoted = true
+        }
       }
 
       await store.save()
@@ -954,7 +973,15 @@ export class Stores {
       })
 
       let wentGlobal = false
-      if (store !== this.globalStore && this.projectStore && indexProjects >= input.globalProjects) {
+      // Repo-local verbs (npm/git/gradle/...) never escalate: their failures are
+      // repo quirks, not agent habits — escalating them would let a broken
+      // `npm install` in one project block every other project.
+      if (
+        store !== this.globalStore &&
+        this.projectStore &&
+        indexProjects >= input.globalProjects &&
+        !isRepoLocal(moved.signature)
+      ) {
         // Global FIRST, then remove the local copy: a crash between the two
         // writes must leave a duplicate (healed by migrate), never a hole.
         await this.globalStore.runLocked(async () => {

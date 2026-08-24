@@ -8,7 +8,7 @@
 import { readFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { join } from "node:path"
-import { canBlock, scrubSecrets } from "../src/patterns"
+import { canBlock, canRemind, isRepoLocal, scrubSecrets } from "../src/patterns"
 import { GateStore, Stores, PLUGIN_VERSION, PROMOTE_SESSIONS, type Gate } from "../src/store"
 import { coerceGateShape, hasNestedTokens } from "../src/validate"
 
@@ -80,6 +80,7 @@ const scopes: Scope[] = [await loadScope(globalDir, true)]
 for (const p of projectDirs) scopes.push(await loadScope(join(p, ".opencode", "dejavu"), false))
 
 const allKeys = new Set(scopes.flatMap((s) => s.gates.map((g) => g.key)))
+const keySignature = new Map(scopes.flatMap((s) => s.gates.map((g) => [g.key, g.signature] as const)))
 const globalScope = scopes[0] as Scope
 const globalKeys = new Set(globalScope.gates.map((g) => g.key))
 const index = await new GateStore(globalDir).loadIndex()
@@ -125,10 +126,10 @@ for (const scope of scopes) {
     for (const g of nested.slice(0, 10)) console.log(`     - ${g.signature}`)
   }
 
-  const blockingNoEvidence = gates.filter((g) => g.status === "blocking" && g.sessions.length < PROMOTE_SESSIONS)
+  const blockingNoEvidence = gates.filter((g) => g.status !== "watching" && g.sessions.length < PROMOTE_SESSIONS)
   if (blockingNoEvidence.length > 0) {
     issues += blockingNoEvidence.length
-    console.log(`   BLOCKING WITHOUT EVIDENCE sessions<${PROMOTE_SESSIONS} (${blockingNoEvidence.length}) — promoted outside policy (hand-edited?):`)
+    console.log(`   ENFORCED WITHOUT EVIDENCE sessions<${PROMOTE_SESSIONS} (${blockingNoEvidence.length}) — promoted outside policy (hand-edited?):`)
     for (const g of blockingNoEvidence.slice(0, 10)) console.log(`     - ${g.signature}`)
   }
 
@@ -139,8 +140,15 @@ for (const scope of scopes) {
     for (const g of staleBlocking.slice(0, 10)) console.log(`     - ${g.signature}`)
   }
 
-  // Gates that can never block could never teach — counters are pre-policy history
-  const notTeaching = gates.filter((g) => g.recurredAfterGate >= 3 && canBlock(g.tool, g.signature))
+  const staleReminding = gates.filter((g) => g.status === "reminding" && !canRemind(g.tool, g.signature))
+  if (staleReminding.length > 0) {
+    issues += staleReminding.length
+    console.log(`   STALE REMINDING outside policy (${staleReminding.length}) — doctor --repair demotes to watching:`)
+    for (const g of staleReminding.slice(0, 10)) console.log(`     - ${g.signature}`)
+  }
+
+  // Gates that could never teach — counters are pre-policy history
+  const notTeaching = gates.filter((g) => g.recurredAfterGate >= 3 && (canBlock(g.tool, g.signature) || canRemind(g.tool, g.signature)))
   if (notTeaching.length > 0) {
     issues += notTeaching.length
     console.log(`   NOT TEACHING recurredAfterGate>=3 (${notTeaching.length}) — gate fires but error recurs; write a correction or delete:`)
@@ -153,7 +161,7 @@ for (const scope of scopes) {
     console.log(`   note: TEACHING (${teaching.length}) — corrected gates with zero recurrences after promotion`)
   }
 
-  const annoying = gates.filter((g) => g.remindedCount >= 10 && canBlock(g.tool, g.signature))
+  const annoying = gates.filter((g) => g.remindedCount >= 10 && (canBlock(g.tool, g.signature) || canRemind(g.tool, g.signature)))
   if (annoying.length > 0) {
     issues += annoying.length
     console.log(`   ANNOYING reminded>=10 (${annoying.length}):`)
@@ -232,8 +240,14 @@ if (missing.length > 0) {
   console.log(`   INDEX MISSING (${missing.length}) — global gates without cross-project tracking; doctor --repair rebuilds`)
 }
 
-// GLOBAL_PROJECTS = 2 (index.ts tunable): 2+ project dirs = agent-level habit
-const missed = indexEntries.filter(([key, entry]) => entry.projects.length >= 2 && !globalKeys.has(key))
+// GLOBAL_PROJECTS = 2 (index.ts tunable): 2+ project dirs = agent-level habit.
+// Repo-local verbs (npm/git/gradle/...) are excluded by policy — their failures
+// are repo quirks and must stay project-scoped, so they are not "missed".
+const missed = indexEntries.filter(([key, entry]) => {
+  if (entry.projects.length < 2 || globalKeys.has(key)) return false
+  const signature = keySignature.get(key)
+  return signature === undefined || !isRepoLocal(signature)
+})
 if (missed.length > 0) {
   crossIssues += missed.length
   console.log(`   MISSED ESCALATION (${missed.length}) — index shows 2+ projects but the gate is not global; doctor --repair escalates:`)

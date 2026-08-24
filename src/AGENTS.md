@@ -12,12 +12,13 @@ Two dependency-free modules: `patterns.ts` (pure functions — call identity, no
 | Interpreter one-liner identity | patterns.ts | `hashInterpreterPayload` — `-c`/`-e` code payload → `<code:hash>` |
 | Chain-bypass protection | patterns.ts | `splitChain` (quote/paren-aware) → `bashSegmentSignatures` |
 | Free-form error collapsing | patterns.ts | `parameterizeError` (event channel) vs `normalizeCommand` (bash) |
-| Near-duplicate merge | patterns.ts | `fuzzySimilar` = normalized `levenshtein` ≤ 0.3 |
+| Near-duplicate merge | patterns.ts | `fuzzySimilar` = normalized `levenshtein` ≤ 0.3 + flag-subset rule |
 | Failure text scan | patterns.ts | `detectFailure` + `FAILURE_SIGNATURES` |
 | Noise filtering | patterns.ts | `isNoiseError` + `NOISE_ERRORS` (aborted/cancelled ≠ failed) |
-| Diagnostic/intended-exit logic | patterns.ts | `DIAGNOSTIC_VERBS`, `isIntendedNonzero`, `canBlock` |
+| Diagnostic/intended-exit logic | patterns.ts | `DIAGNOSTIC_VERBS`, `isIntendedNonzero`, `canBlock`, `canRemind` |
+| Escalation scope policy | patterns.ts | `isRepoLocal` + `REPO_LOCAL_VERBS` — repo-local verbs never escalate globally |
 | One scope (gates.json + index.json + log.jsonl) | store.ts | `GateStore` — `load`/`save`/`loadIndex`/`saveIndex`/`log`/`expire`/`extract`/`rotateLog`/`reconcile` |
-| Two-scope logic + promotion | store.ts | `Stores` — `findGate`/`recordFailure`/`migrate`/`blockingGates`/`reconcileAll`; `mergeGate` merges duplicate keys |
+| Two-scope logic + promotion | store.ts | `Stores` — `findGate`/`recordFailure`/`migrate`/`enforcedGates`/`reconcileAll`; `mergeGate` merges duplicate keys |
 | Gate parse/repair boundary | validate.ts | `coerceGateShape` (strict parse), `repairGate` (mechanical coercion), `hasNestedTokens` (corruption fingerprint) |
 | fs safety | store.ts | `ntPath`, `atomicWrite`, `withLock` |
 
@@ -26,7 +27,9 @@ Two dependency-free modules: `patterns.ts` (pure functions — call identity, no
 - Rule order in `PARAM_RULES` matters: quoted strings first, specific tokens (uuid/sha/ip/url/date), generic numbers last — reordering fragments signatures
 - Rule order in `normalizeCommand` matters too: quoted strings are parameterized BEFORE path rules — a `<str>` substitution inserts spaces that would expose an adjacent `/` to the path rule on a second pass (idempotency); interpreter payload hashing runs while the payload is still raw
 - `scrubSecrets()` runs on every string before it touches disk; `recordFailure` re-scrubs defensively
-- `canBlock(tool, sig)` = bash && non-diagnostic && not a bare one-liner shape — the ONLY path to `blocking`; probe tools use `PROMOTE_COUNT_PROBE` and never block
+- Three enforcement tiers: `canBlock` (bash && non-diagnostic && not a bare one-liner shape) is the ONLY path to `blocking`; `canRemind` (diagnostic bash) is the only path to `reminding`; probe tools use `PROMOTE_COUNT_PROBE` and never leave `watching`
+- Repo-local verbs (`isRepoLocal`) never escalate to the global store — their failures are repo quirks; both escalation paths (`recordFailure` + `reconcileAll`) and doctor's MISSED-ESCALATION honor this
+- Fuzzy merging requires comparable flag sets (one a subset of the other) — disjoint switches are different operations and must never merge; subset additions still consolidate
 - `DIAGNOSTIC_VERBS` serves two callers (exit-1 allowlist + blocking policy) — one list, two uses; edit knowing both move
 - Lock order is always project → global, gates → index (see `recordFailure` escalation) — reversing deadlocks; the log lock is separate and leaf-level
 - Cross-project evidence lives ONLY in the global `index.json` — a gate's own `projects` array sees one store and never drives escalation alone
@@ -35,7 +38,7 @@ Two dependency-free modules: `patterns.ts` (pure functions — call identity, no
 - Fuzzy consolidation in `recordFailure` prefers the gate holding the session's reminded state (before/after hooks must stay in sync) and never overwrites the evidence snippet
 - Snippets and corrections are UNTRUSTED text re-injected into agent context — keep the data-label framing in messages, the 200-char correction bound, and scrub quarantine bytes
 - Inside `runLocked` always `load(true)`; unlocked `load()` peeks are routing hints only, never a basis for mutation
-- Hot-path reads use the 1s TTL cache + key index (`byKey`/`blockingOnly`); mutations inside locks use `load(true)`; `save()` refreshes the cache directly
+- Hot-path reads use the 1s TTL cache + key index (`byKey`/`enforcedOnly`); mutations inside locks use `load(true)`; `save()` refreshes the cache directly
 - The remind→block chain is persisted ON THE GATE (`remindedSessions`/`failedSessions`) and enforced under the store lock — process memory holds nothing authoritative, so several windows and restarts share one escalation
 - Log appends and rotation take the log lock — every OpenCode window shares the global log; unlocked appends interleave into broken JSON
 - Every gate read from disk crosses `coerceGateShape` + `repairGate` in `load()` — enforcement never sees raw state; hopeless records are dropped, repairable ones coerced

@@ -5,7 +5,7 @@
  * coerceGateShape + repairGate satisfies the data-model invariants.
  */
 import type { Gate } from "./store"
-import { canBlock, scrubSecrets } from "./patterns"
+import { canBlock, canRemind, scrubSecrets } from "./patterns"
 
 /** sha1 prefix-12, the only key shape patternKey ever emits */
 const KEY_SHAPE = /^[0-9a-f]{12}$/
@@ -27,7 +27,7 @@ export function coerceGateShape(raw: unknown): Gate | null {
   if (typeof r.key !== "string" || !KEY_SHAPE.test(r.key)) return null
   if (typeof r.signature !== "string" || r.signature.trim() === "") return null
   if (typeof r.tool !== "string" || r.tool.trim() === "") return null
-  if (r.status !== "watching" && r.status !== "blocking") return null
+  if (r.status !== "watching" && r.status !== "reminding" && r.status !== "blocking") return null
 
   const num = (v: unknown, fallback: number): number =>
     typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.floor(v) : fallback
@@ -157,9 +157,14 @@ export function repairGate(gate: Gate): boolean {
     }
     if (Object.keys(failed).length === 0) delete gate.failedSessions
   }
-  // Policy is the single source of truth: a blocking gate that cannot block
-  // is a leftover from an older policy and must be demoted.
+  // Policy is the single source of truth: an enforced gate that no longer
+  // qualifies is a leftover from an older policy and must be demoted —
+  // blocking to reminding if the shape can still remind, else to watching.
   if (gate.status === "blocking" && !canBlock(gate.tool, gate.signature)) {
+    gate.status = canRemind(gate.tool, gate.signature) ? "reminding" : "watching"
+    changed = true
+  }
+  if (gate.status === "reminding" && !canRemind(gate.tool, gate.signature)) {
     gate.status = "watching"
     changed = true
   }

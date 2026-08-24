@@ -277,7 +277,7 @@ await emitToolError("rp-r5", "read", "r5", "File not found", { filePath: "src/mi
 gates = await readGates()
 check("read failure NEVER promotes (policy: probes cannot block)", gates.find((g) => g.signature === "read:missing_probe_target.py")?.status === "watching")
 
-// --- 11b. diagnostics never promote either ---
+// --- 11b. diagnostics promote to REMIND-ONLY: signal without punishment ---
 const TSC = "npx tsc --noEmit"
 await after(
   { tool: "bash", sessionID: "s50", callID: "t1", args: { command: TSC } } as unknown as AfterInput,
@@ -292,7 +292,15 @@ await after(
   { title: TSC, output: "src/x.ts(1,1): error TS2322: Type 'string' is not assignable", metadata: {} } as unknown as AfterOutput,
 )
 gates = await readGates()
-check("diagnostic (tsc) never promotes to blocking", gates.find((g) => g.signature === `bash:${TSC.toLowerCase()}`)?.status === "watching")
+check("diagnostic promotes to remind-only (never blocking)", gates.find((g) => g.signature === `bash:${TSC.toLowerCase()}`)?.status === "reminding")
+
+// remind-only gate: reminds, then allows retries forever — never blocks
+const tscRemind = await attempt(TSC, "s52", "t4")
+check("remind-only gate reminds on first encounter", tscRemind !== null && tscRemind.message.includes("[dejavu] REMINDER"))
+await fail(TSC, "s52", "t5") // retry fails again — must NOT escalate to block
+await new Promise((resolve) => setTimeout(resolve, 600))
+const tscRetry = await attempt(TSC, "s52", "t6")
+check("remind-only gate never blocks after repeated failure", tscRetry === null)
 
 // --- 12. read output is file CONTENT: text signatures must not apply ---
 await after(
@@ -718,6 +726,28 @@ await seedGates(healRetireDir, [
 await Dejavu({ directory: healRetireDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
 const healLog = await readFile(join(healRetireDir, ".opencode", "dejavu", "log.jsonl"), "utf8")
 check("corrected gate with zero recurrences retires healed", healLog.includes('"type":"retired-healed"'))
+
+// --- 34. flag-aware fuzzy: disjoint flags never merge, short subset additions still do ---
+check("disjoint flags never fuzzy-merge", !fuzzySimilar("bash:python train.py --lr <n>", "bash:python train.py --epochs <n>"))
+check("disjoint short flags rejected even within length band", !fuzzySimilar("bash:python train.py --lr", "bash:python train.py -v"))
+check("subset flag addition still merges", fuzzySimilar("bash:python train.py", "bash:python train.py -v"))
+
+// --- 35. repo-local verbs never escalate to the global store ---
+const repoDirA = join(tmp, "repo-local-a")
+const repoDirB = join(tmp, "repo-local-b")
+const hooksRA = await Dejavu({ directory: repoDirA, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+const hooksRB = await Dejavu({ directory: repoDirB, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+const REPO_CMD = "npm install --legacy-peer-deps"
+await failOn(hooksRA)(REPO_CMD, "ra1", "ra1")
+await failOn(hooksRA)(REPO_CMD, "ra1", "ra2")
+await failOn(hooksRA)(REPO_CMD, "ra2", "ra3")
+const repoGatesA = await readJson(join(repoDirA, ".opencode", "dejavu", "gates.json"))
+check("repo-local gate promotes in its own project", repoGatesA.some((g) => g.signature === `bash:${REPO_CMD}` && g.status === "blocking"))
+await failOn(hooksRB)(REPO_CMD, "rb1", "rb1")
+const repoGlobalGates = await readJson(join(tmp, "global", "gates.json")).catch(() => [] as GateRow[])
+check("repo-local failure in a second project does NOT escalate globally", !repoGlobalGates.some((g) => g.signature === `bash:${REPO_CMD}`))
+const repoGatesA2 = await readJson(join(repoDirA, ".opencode", "dejavu", "gates.json"))
+check("repo-local gate stays in its project store", repoGatesA2.some((g) => g.signature === `bash:${REPO_CMD}`))
 
 await rm(tmp, { recursive: true, force: true })
 
