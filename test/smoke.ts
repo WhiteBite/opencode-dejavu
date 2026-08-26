@@ -764,6 +764,33 @@ const fuzzIdx = JSON.parse(await readFile(join(tmp, "global", "index.json"), "ut
 check("index tracks the gate key (escalation stays alive)", fuzzIdx.keys[baseKey] !== undefined)
 check("raw variant key is not orphaned in the index", fuzzIdx.keys[variantKey] === undefined)
 
+// --- 37. healed gate: successes after a gate retire it so it stops reminding ---
+const healBDir = join(tmp, "heal-project")
+const hooksH = await Dejavu({ directory: healBDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+const HEAL_CMD = "deploy --to heal"
+const succeed = async (session: string, callID: string): Promise<void> => {
+  await (hooksH["tool.execute.after"] as AfterHook)(
+    { tool: "bash", sessionID: session, callID, args: { command: HEAL_CMD } } as unknown as AfterInput,
+    { title: HEAL_CMD, output: "ok", metadata: { exit: 0 } } as unknown as AfterOutput,
+  )
+}
+await failOn(hooksH)(HEAL_CMD, "h1", "h1")
+await failOn(hooksH)(HEAL_CMD, "h1", "h2")
+await failOn(hooksH)(HEAL_CMD, "h2", "h3")
+const healKey = patternKey(callSignature("bash", { command: HEAL_CMD }) ?? "")
+check("gate promoted before heal", (await readJson(join(healBDir, ".opencode", "dejavu", "gates.json"))).find((g) => g.key === healKey)?.status === "blocking")
+const healBRemind = await attemptWith(hooksH)(HEAL_CMD, "h3", "h4")
+check("active gate reminds", healBRemind !== null && healBRemind.message.includes("[dejavu] REMINDER"))
+await succeed("h3", "h5")
+await succeed("h3", "h6")
+await succeed("h3", "h7")
+const healBGates = await readJson(join(healBDir, ".opencode", "dejavu", "gates.json"))
+check("gate heals to watching after 3 successes", healBGates.find((g) => g.key === healKey)?.status === "watching")
+const healBAfter = await attemptWith(hooksH)(HEAL_CMD, "h3", "h8")
+check("healed gate no longer reminds", healBAfter === null)
+const healBLog = await readFile(join(healBDir, ".opencode", "dejavu", "log.jsonl"), "utf8")
+check("heal event logged", healBLog.includes('"type":"healed"'))
+
 await rm(tmp, { recursive: true, force: true })
 
 if (failures > 0) {

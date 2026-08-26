@@ -236,8 +236,6 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
         // grep/pytest/linters: exit 1 is often the INTENDED outcome, not a mistake.
         const intended = exitCode === 1 && isIntendedNonzero(rawCommand, 1)
         const failed = exitCode !== null ? exitCode !== 0 && !intended : detection.matched
-        if (!failed) return
-        const snippet = scrubSecrets(detection.matched ? detection.snippet : `exit code ${exitCode}`)
 
         const args = scrubbedArgs(((input as { args?: unknown }).args ?? {}) as Record<string, unknown>)
         let signature = callSignature(input.tool, args)
@@ -247,9 +245,9 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
         }
         if (!signature) return
 
-        // Attribution: if a segment of a failed chain matches an already-known
-        // pattern, record the failure under that segment's key — the chain
-        // wrapper changes every time, the recurring part does not.
+        // Attribution: if a segment of the chain matches an already-known
+        // pattern, attribute to that segment's key — the chain wrapper changes
+        // every time, the recurring part does not.
         let recordSignature = signature
         if (input.tool === "bash" && typeof args.command === "string") {
           for (const segSig of bashSegmentSignatures(args.command)) {
@@ -259,9 +257,18 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
             }
           }
         }
-
         const key = patternKey(recordSignature)
         const session = typeof input.sessionID === "string" ? input.sessionID : "unknown"
+
+        // A SUCCESS matching an enforced gate is evidence the command got fixed —
+        // track the streak so healed commands stop reminding (only bash gates
+        // enforce, so only bash successes can heal).
+        if (!failed) {
+          if (isBash) await stores.recordSuccess({ key, signature: recordSignature, tool: input.tool })
+          return
+        }
+
+        const snippet = scrubSecrets(detection.matched ? detection.snippet : `exit code ${exitCode}`)
 
         const result = await stores.recordFailure({
           key,

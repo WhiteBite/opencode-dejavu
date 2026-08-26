@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.6.0 — 2026-08-26
+
+### Added (only well-grounded triggers)
+- **Gates heal.** dejavu previously only saw failures, so a gate kept reminding even after the underlying command was fixed (the `ruff check .` false positive). Now a SUCCESS matching an enforced gate increments `succeededAfterGate`; after `HEAL_SUCCESSES` (3) consecutive successes the gate retires to `watching` and logs `healed`, so fixed commands stop triggering. A failure resets the streak.
+
 ## 2.5.1 — 2026-08-26
 
 ### Fixed

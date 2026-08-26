@@ -89,7 +89,7 @@ dejavu-opencode-plugin/
 - Self-healing stores: every init runs `reconcileAll()` — unparseable files are quarantined (bytes preserved in `*.corrupt-*`, never deleted), records are strictly parsed + mechanically repaired, index is reconciled, and every repair is logged (`repaired`/`quarantined` events); `doctor --repair` does the same on demand — one command replaces hand-debugging
 - Multi-window safe: the remind→block chain is persisted on the gate, not in process memory — several OpenCode windows (each its own process on the shared store) and process restarts all see the same escalation; hot-path reads use a 1s TTL cache + O(1) key index
 - `dejavu:proceed` escape hatch: trailing marker comment, matched with word boundaries, stripped before normalization so bypassed failures land on the original pattern
-- `recurredAfterGate` is THE health metric — gates that fire without killing the error get `review: true`
+- `recurredAfterGate` is THE health metric — gates that fire without killing the error get `review: true`; its mirror `succeededAfterGate` heals gates — 3 consecutive successes on an enforced gate retire it to `watching`, so a fixed command stops reminding
 - Windows-first fs: `\\?\` long-path prefix, tmp+rename with EPERM/EACCES/EBUSY backoff, lockfile with stale-steal and 3s degrade-to-unlocked (never hang the tool pipeline)
 
 ## COMMANDS

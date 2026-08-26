@@ -72,6 +72,7 @@ Restart OpenCode. Gates appear automatically as failures recur — nothing to co
 - **Bounded memory** — per-session maps are capped (200 sessions) and freed on `session.deleted`; handled part IDs evict FIFO; TTL expiry re-runs every 6 h in long-lived processes.
 - **Migration** — gates outside the blocking policy are demoted to `watching` automatically; project copies of already-global gates are merged into the global gate (evidence is consolidated, never deleted).
 - **Self-healing** — every init reconciles the stores: an unparseable `gates.json` is quarantined (bytes preserved as `gates.json.corrupt-<ts>`), gate records are strictly parsed and mechanically repaired (inverted dates swapped, duplicate keys merged, secrets re-scrubbed, stale blocking demoted), unparseable log lines are excised to `log.jsonl.corrupt`, and the cross-project index is reconciled. Every repair is logged as a `repaired`/`quarantined` event.
+- **Gates heal, not just accumulate** — dejavu sees successes too: a SUCCESS matching an enforced gate grows `succeededAfterGate`, and after 3 in a row the gate retires to `watching` (logged `healed`), so a command you fixed stops triggering reminders. A failure resets the streak. This kills the "ruff check passed 10 times but dejavu still reminds" false positive.
 
 ## Observability (debugging aids)
 
@@ -112,7 +113,7 @@ bun run typecheck        # tsc --noEmit (index.ts + src/**)
 bun test/smoke.ts        # behavioral smoke test, no framework needed
 ```
 
-Tunables are named constants at the top of `index.ts` and `src/store.ts`: `PROMOTE_COUNT` (3), `PROMOTE_COUNT_PROBE` (5), `PROMOTE_SESSIONS` (2), `GLOBAL_PROJECTS` (2), `TTL_DAYS` (60), `NOISE_TTL_DAYS` (7), `REVIEW_FIRES` (10), `MAX_GATES` (2000).
+Tunables are named constants at the top of `index.ts` and `src/store.ts`: `PROMOTE_COUNT` (3), `PROMOTE_COUNT_PROBE` (5), `PROMOTE_SESSIONS` (2), `GLOBAL_PROJECTS` (2), `TTL_DAYS` (60), `NOISE_TTL_DAYS` (7), `REVIEW_FIRES` (10), `MAX_GATES` (2000), `HEAL_SUCCESSES` (3).
 
 ## Roadmap
 

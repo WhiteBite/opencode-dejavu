@@ -4,7 +4,7 @@ import { canBlock, canRemind, fuzzySimilar, FUZZY_MAX_LEN, isRepoLocal, scrubSec
 import { coerceGateShape, repairGate } from "./validate"
 
 /** Bumped on behavior changes; stamped into init log events so stale sessions are visible. */
-export const PLUGIN_VERSION = "2.5.1"
+export const PLUGIN_VERSION = "2.6.0"
 
 export interface Gate {
   /** sha1 signature prefix — the pattern identity */
@@ -31,6 +31,9 @@ export interface Gate {
   recurredAfterReminder: number
   /** the core health metric: failures of this pattern AFTER it became a gate */
   recurredAfterGate: number
+  /** consecutive successes after the gate was enforced — reaching HEAL_SUCCESSES
+   * retires the gate to watching (the underlying command got fixed) */
+  succeededAfterGate?: number
   /** flagged for manual review when the gate fires often but errors stopped */
   review?: boolean
   /** sessions currently reminded about this gate: sessionID -> remind time (ms).
@@ -73,6 +76,7 @@ export type LogEventType =
   | "quarantined"
   | "degraded"
   | "retired-healed"
+  | "healed"
 
 export interface LogEvent {
   type: LogEventType
@@ -108,6 +112,9 @@ export const PROMOTE_COUNT_PROBE = 5
 export const PROBE_TOOLS = new Set(["read", "glob", "grep", "write", "edit"])
 /** distinct sessions required — same-session loops never promote */
 export const PROMOTE_SESSIONS = 2
+/** consecutive successes after a gate that retire it — the command is fixed,
+ * so the gate must stop reminding (the ruff-check-false-positive case) */
+export const HEAL_SUCCESSES = 3
 /** store size bound: flooding with unique failures must not bloat gates.json
  * or slow the fuzzy scan — the weakest watching gate is evicted past this */
 export const MAX_GATES = 2000
@@ -933,6 +940,8 @@ export class Stores {
       // Only an exact-key failure updates the evidence: a crafted near-duplicate
       // must not overwrite a legitimate gate's snippet via fuzzy consolidation.
       if (!fuzzyConsolidated) gate.snippet = scrubSecrets(input.snippet)
+      // A failure breaks any heal streak — the command is still broken.
+      gate.succeededAfterGate = 0
 
       let promoted = false
       const threshold = PROBE_TOOLS.has(input.tool) ? PROMOTE_COUNT_PROBE : PROMOTE_COUNT
@@ -1004,6 +1013,36 @@ export class Stores {
       }
 
       return { gate: moved, store, promoted, wentGlobal }
+    })
+  }
+
+  /**
+   * A SUCCESS matching an enforced gate is evidence the underlying command got
+   * fixed. Track a streak; once it reaches HEAL_SUCCESSES the gate retires to
+   * watching so it stops reminding on a now-healthy command (the
+   * `ruff check .` false-positive case). Only enforced (blocking/reminding)
+   * gates heal; a failure resets the streak in recordFailure.
+   */
+  async recordSuccess(input: { key: string; signature: string; tool: string }): Promise<void> {
+    const match = await this.findGate(input.key, input.signature)
+    if (match === null || match.gate.status === "watching") return
+    const store = match.store
+    const gateKey = match.gate.key
+    await store.runLocked(async () => {
+      const fresh = (await store.load(true)).find((g) => g.key === gateKey)
+      if (fresh === undefined || fresh.status === "watching") return
+      fresh.succeededAfterGate = (fresh.succeededAfterGate ?? 0) + 1
+      const healed = fresh.succeededAfterGate >= HEAL_SUCCESSES
+      if (healed) fresh.status = "watching"
+      await store.save()
+      if (healed) {
+        await store.log({
+          type: "healed",
+          key: fresh.key,
+          tool: fresh.tool,
+          snippet: `succeeded ${fresh.succeededAfterGate}x in a row after the gate — retired to watching`,
+        })
+      }
     })
   }
 }

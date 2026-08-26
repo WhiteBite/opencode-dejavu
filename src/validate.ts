@@ -52,6 +52,9 @@ export function coerceGateShape(raw: unknown): Gate | null {
     recurredAfterReminder: num(r.recurredAfterReminder, 0),
     recurredAfterGate: num(r.recurredAfterGate, 0),
   }
+  if (typeof r.succeededAfterGate === "number" && Number.isFinite(r.succeededAfterGate) && r.succeededAfterGate > 0) {
+    gate.succeededAfterGate = Math.floor(r.succeededAfterGate)
+  }
   if (typeof r.correction === "string") gate.correction = r.correction
   if (r.review === true) gate.review = true
   if (r.remindedSessions !== null && typeof r.remindedSessions === "object" && !Array.isArray(r.remindedSessions)) {

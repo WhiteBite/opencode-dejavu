@@ -40,6 +40,7 @@ Two dependency-free modules: `patterns.ts` (pure functions — call identity, no
 - Inside `runLocked` always `load(true)`; unlocked `load()` peeks are routing hints only, never a basis for mutation
 - Hot-path reads use the 1s TTL cache + key index (`byKey`/`enforcedOnly`); mutations inside locks use `load(true)`; `save()` refreshes the cache directly
 - The remind→block chain is persisted ON THE GATE (`remindedSessions`/`failedSessions`) and enforced under the store lock — process memory holds nothing authoritative, so several windows and restarts share one escalation
+- Successes heal: `recordSuccess` grows `succeededAfterGate` on an enforced gate; at `HEAL_SUCCESSES` (3) it retires to `watching` and logs `healed`. A failure resets the streak in `recordFailure`. Only bash successes heal (only bash gates enforce)
 - Log appends and rotation take the log lock — every OpenCode window shares the global log; unlocked appends interleave into broken JSON
 - Every gate read from disk crosses `coerceGateShape` + `repairGate` in `load()` — enforcement never sees raw state; hopeless records are dropped, repairable ones coerced
 - Quarantine preserves bytes: unparseable files are renamed to `*.corrupt-*`, never deleted; every repair emits a `repaired`/`quarantined` log event
