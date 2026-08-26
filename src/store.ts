@@ -4,7 +4,7 @@ import { canBlock, canRemind, fuzzySimilar, FUZZY_MAX_LEN, isRepoLocal, scrubSec
 import { coerceGateShape, repairGate } from "./validate"
 
 /** Bumped on behavior changes; stamped into init log events so stale sessions are visible. */
-export const PLUGIN_VERSION = "2.5.0"
+export const PLUGIN_VERSION = "2.5.1"
 
 export interface Gate {
   /** sha1 signature prefix — the pattern identity */
@@ -954,14 +954,17 @@ export class Stores {
       // ever sees its own store's directory, so alone it can never reach two
       // projects. A pattern seen in enough distinct project dirs is an
       // agent-level habit, not a repo quirk — move it to the global store.
+      // Keyed by the gate's OWN key (post fuzzy-consolidation), not the raw
+      // failure key — otherwise consolidated failures index a key that has no
+      // gate, orphaning the entry and starving the gate's escalation.
       // Lock order is always gates -> index and project -> global: no cycles.
       const moved = gate
       const indexProjects = await this.globalStore.runLockedIndex(async () => {
         const index = await this.globalStore.loadIndex(true)
-        let entry = index.keys[input.key]
+        let entry = index.keys[moved.key]
         if (!entry) {
           entry = { projects: [], lastSeen: now }
-          index.keys[input.key] = entry
+          index.keys[moved.key] = entry
         }
         if (input.projectDir !== "" && !entry.projects.includes(input.projectDir)) {
           entry.projects.push(input.projectDir)

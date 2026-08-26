@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.5.1 — 2026-08-26
+
+### Fixed
+- Cross-project index + forensic log now key on the gate's OWN key (post fuzzy-consolidation), not the raw failure key. Before, a failure that fuzzy-merged into an existing gate indexed a key with no gate — orphaning the entry and silently starving that gate's cross-project escalation (the "INDEX ORPHANS" you'd see in doctor).
+
 ## 2.5.0 — 2026-08-24
 
 ### Changed (the three known gaps, closed)

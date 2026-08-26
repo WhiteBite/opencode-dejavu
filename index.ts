@@ -275,7 +275,7 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
 
         await stores.logAll({
           type: "detected",
-          key,
+          key: result.gate.key,
           tool: input.tool,
           session,
           project: directory,
@@ -285,7 +285,7 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
         })
 
         if (result.promoted) {
-          await stores.logAll({ type: "promoted", key, tool: input.tool, session, project: directory })
+          await stores.logAll({ type: "promoted", key: result.gate.key, tool: input.tool, session, project: directory })
           await logClient(
             "info",
             `dejavu: gate promoted — "${result.gate.signature}" (${result.gate.count}x, ${result.gate.sessions.length} sessions)`,

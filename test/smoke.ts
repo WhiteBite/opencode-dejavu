@@ -749,6 +749,21 @@ check("repo-local failure in a second project does NOT escalate globally", !repo
 const repoGatesA2 = await readJson(join(repoDirA, ".opencode", "dejavu", "gates.json"))
 check("repo-local gate stays in its project store", repoGatesA2.some((g) => g.signature === `bash:${REPO_CMD}`))
 
+// --- 36. fuzzy-consolidated failure indexes the GATE's key, not the raw key ---
+// (raw-key indexing orphaned entries and starved cross-project escalation)
+const fuzzIdxDir = join(tmp, "fuzz-idx-project")
+const hooksFI = await Dejavu({ directory: fuzzIdxDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+const baseSig = callSignature("bash", { command: "python train.py" }) ?? ""
+const baseKey = patternKey(baseSig)
+const variantKey = patternKey(callSignature("bash", { command: "python train.py -v" }) ?? "")
+await failOn(hooksFI)("python train.py", "fi1", "fi1")
+await failOn(hooksFI)("python train.py -v", "fi1", "fi2")
+const fuzzGates = await readJson(join(fuzzIdxDir, ".opencode", "dejavu", "gates.json"))
+check("fuzzy variant consolidated into the base gate", fuzzGates.find((g) => g.key === baseKey)?.count === 2 && !fuzzGates.some((g) => g.key === variantKey))
+const fuzzIdx = JSON.parse(await readFile(join(tmp, "global", "index.json"), "utf8")) as { keys: Record<string, unknown> }
+check("index tracks the gate key (escalation stays alive)", fuzzIdx.keys[baseKey] !== undefined)
+check("raw variant key is not orphaned in the index", fuzzIdx.keys[variantKey] === undefined)
+
 await rm(tmp, { recursive: true, force: true })
 
 if (failures > 0) {
