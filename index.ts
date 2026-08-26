@@ -5,6 +5,7 @@ import {
   bashSegmentSignatures,
   callSignature,
   detectFailure,
+  failureSnippet,
   isIntendedNonzero,
   isNoiseError,
   parameterizeError,
@@ -268,7 +269,7 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
           return
         }
 
-        const snippet = scrubSecrets(detection.matched ? detection.snippet : `exit code ${exitCode}`)
+        const snippet = scrubSecrets(detection.matched ? detection.snippet : failureSnippet(text, exitCode))
 
         const result = await stores.recordFailure({
           key,

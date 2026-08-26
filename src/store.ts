@@ -1,10 +1,10 @@
 import { appendFile, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
-import { canBlock, canRemind, fuzzySimilar, FUZZY_MAX_LEN, isRepoLocal, scrubSecrets } from "./patterns"
+import { canBlock, canRemind, fuzzySimilar, FUZZY_MAX_LEN, isRepoLocal, scrubSecrets, suggestCorrection } from "./patterns"
 import { coerceGateShape, repairGate } from "./validate"
 
 /** Bumped on behavior changes; stamped into init log events so stale sessions are visible. */
-export const PLUGIN_VERSION = "2.6.0"
+export const PLUGIN_VERSION = "2.7.0"
 
 export interface Gate {
   /** sha1 signature prefix — the pattern identity */
@@ -727,6 +727,12 @@ export class Stores {
               changed = true
             }
           }
+          // Backfill: an enforced gate with no correction gets a mechanical
+          // default so it teaches immediately instead of sitting "NOT TEACHING".
+          if (gate.status !== "watching" && gate.correction === undefined) {
+            gate.correction = suggestCorrection(gate.signature, gate.snippet)
+            changed = true
+          }
         }
         if (changed) await store.save()
       })
@@ -954,6 +960,11 @@ export class Stores {
         } else if (canRemind(gate.tool, gate.signature)) {
           gate.status = "reminding"
           promoted = true
+        }
+        // A promoted gate always ships with SOME teaching text (mechanical
+        // default, overridable) so it never sits "NOT TEACHING" awaiting a human.
+        if (promoted && gate.correction === undefined) {
+          gate.correction = suggestCorrection(gate.signature, gate.snippet)
         }
       }
 

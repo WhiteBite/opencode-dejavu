@@ -460,6 +460,22 @@ export function detectFailure(outputText: string): FailureDetection {
   return { matched: false, snippet: "" }
 }
 
+/**
+ * For exit-code failures whose output matched no signature, a bare
+ * "exit code N" gives a human/agent nothing to write a correction from.
+ * Bash output is command output (safe to surface), so keep the last non-empty
+ * line — compilers/test runners print their summary at the end.
+ */
+export function failureSnippet(outputText: string, exitCode: number | null): string {
+  const lines = outputText
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l !== "")
+  const tail = lines[lines.length - 1]
+  if (tail !== undefined && tail !== "") return tail.slice(0, 200)
+  return `exit code ${exitCode}`
+}
+
 // --- Noise filtering ----------------------------------------------------------
 
 /**
@@ -477,4 +493,34 @@ const NOISE_ERRORS: RegExp[] = [
 
 export function isNoiseError(errorText: string): boolean {
   return NOISE_ERRORS.some((rule) => rule.test(errorText))
+}
+
+// --- Default corrections ------------------------------------------------------
+
+/**
+ * Mechanical, overridable default correction chosen by command family, so a
+ * promoted gate always ships with SOME teaching text instead of sitting
+ * "NOT TEACHING" until a human writes one. Rules, not an LLM — the hot path
+ * stays mechanical; a human/agent may refine the text later.
+ */
+export function suggestCorrection(signature: string, snippet: string): string {
+  if (/(^|\s)(--check|--dry-run|verify|check)\b/i.test(signature) && /dart run|generate|sync/i.test(signature)) {
+    return "Generated artifacts are stale — run the same script WITHOUT the check flag to regenerate, then commit the result."
+  }
+  if (/\b(pytest|jest|vitest|mocha|cucumbertest|flutter test|npm test|gradlew\b[^\n]*test|dart test)\b/i.test(signature)) {
+    return "A test is failing — read the failing assertion in the output and fix the code or the expectation; do not re-run the suite blindly."
+  }
+  if (/\b(tsc|typecheck|type-check)\b/i.test(signature)) {
+    return "Type errors — run the compiler, read the reported file:line diagnostics, and fix the types before retrying."
+  }
+  if (/\b(curl|wget)\b/i.test(signature)) {
+    return "Network/endpoint failure — verify the URL is reachable, check rate limits and timeouts; retry with backoff, not immediately."
+  }
+  if (/\b(npm|yarn|pnpm|bun)\s+(install|ci)\b/i.test(signature)) {
+    return "Dependency install failed — inspect the resolver error; try the lockfile/legacy-peer-deps route the repo documents."
+  }
+  if (snippet !== "" && snippet !== "exit code 1") {
+    return `Last error: "${snippet}" — address that specific error before retrying this exact call.`
+  }
+  return "This exact call keeps failing — inspect the last output line and change approach before retrying."
 }

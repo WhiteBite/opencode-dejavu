@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.7.0 — 2026-08-26
+
+### Added (no more manual corrections)
+- **Auto-corrections.** A promoted gate now always ships with a mechanical, overridable default correction (`suggestCorrection`), chosen by command family (stale `--check` artifacts, failing tests, type errors, network, installs) or from the captured error line — so a gate never sits "NOT TEACHING" awaiting a human. `migrate()` backfills existing enforced gates.
+- **Richer snippets.** For exit-code failures whose output matched no signature, dejavu keeps the last non-empty output line (`failureSnippet`) instead of a bare "exit code N", giving corrections real context.
+
 ## 2.6.0 — 2026-08-26
 
 ### Added (only well-grounded triggers)
