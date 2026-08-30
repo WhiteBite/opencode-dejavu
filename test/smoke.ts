@@ -2,12 +2,30 @@
  * Behavioral smoke test for the dejavu state machine.
  * Run: bun test/smoke.ts
  */
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises"
+import { spawnSync } from "node:child_process"
+import { existsSync } from "node:fs"
+import { mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { fileURLToPath } from "node:url"
 import { Dejavu } from "../index"
-import { callSignature, canBlock, fuzzySimilar, parameterizeError, patternKey, scrubSecrets, splitChain } from "../src/patterns"
-import { GateStore, Stores, mergeGate, type Gate } from "../src/store"
+import {
+  bashSegmentSignatures,
+  callSignature,
+  canBlock,
+  canRemind,
+  fuzzySimilar,
+  hasResidualIdentity,
+  isIntendedNonzero,
+  normalizeCommand,
+  parameterizeError,
+  patternKey,
+  scrubSecrets,
+  splitChain,
+  stripControl,
+  suggestCorrection,
+} from "../src/patterns"
+import { DEMOTE_OVERRIDES, GateStore, MAX_SESSIONS, PLUGIN_VERSION, Stores, mergeGate, type Gate } from "../src/store"
 
 type Ctx = Parameters<typeof Dejavu>[0]
 type Hooks = Awaited<ReturnType<typeof Dejavu>>
@@ -33,6 +51,12 @@ interface GateRow {
   correction?: string
   remindedSessions?: Record<string, number>
   failedSessions?: Record<string, number>
+  overrideCount?: number
+  feedbackDemoted?: boolean
+  succeededAfterGate?: number
+  reoffenseSessions?: string[]
+  remindedCount?: number
+  recurredAfterGate?: number
 }
 
 let failures = 0
@@ -54,8 +78,13 @@ const ctx = {
 } as unknown as Ctx
 
 // --- Pre-seed: gates learned under the OLD policy, one with a leaked secret ---
+// Dates are relative to NOW: hardcoded dates rot — once lastSeen fell outside
+// the 7-day noise TTL the seeded gates expired during init and the migration
+// checks failed on a date, not on behavior.
 await mkdir(join(tmp, "project", ".opencode", "dejavu"), { recursive: true })
 const SECRET = "sk-proj-ABCDEFGHIJKLMNOPQRSTUVWXyz0123456789"
+const seedFirstSeen = new Date(Date.now() - 20 * 24 * 60 * 60 * 1000).toISOString()
+const seedLastSeen = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
 await writeFile(
   join(tmp, "project", ".opencode", "dejavu", "gates.json"),
   JSON.stringify(
@@ -70,8 +99,8 @@ await writeFile(
           count: 5,
           sessions: ["old1", "old2"],
           projects: ["oldproj"],
-          firstSeen: "2026-08-01T00:00:00.000Z",
-          lastSeen: "2026-08-20T00:00:00.000Z",
+          firstSeen: seedFirstSeen,
+          lastSeen: seedLastSeen,
           snippet: "12: except (TypeError, ValueError):",
           remindedCount: 3,
           blockedCount: 1,
@@ -86,8 +115,8 @@ await writeFile(
           count: 1,
           sessions: ["old1"],
           projects: ["oldproj"],
-          firstSeen: "2026-08-01T00:00:00.000Z",
-          lastSeen: "2026-08-20T00:00:00.000Z",
+          firstSeen: seedFirstSeen,
+          lastSeen: seedLastSeen,
           snippet: SECRET,
           remindedCount: 0,
           blockedCount: 0,
@@ -501,7 +530,10 @@ check(
 )
 check("excised bytes preserved in log.jsonl.corrupt", (await readFile(join(logDejavu, "log.jsonl.corrupt"), "utf8").catch(() => "")).includes("{broken line"))
 
-// --- 25. self-healing: index orphans pruned, missing rebuilt, proven gates escalated ---
+// --- 25. self-healing: index orphans SURVIVE reconcile (their gate may live
+// in another project's store, invisible to this process — pruning destroyed
+// cross-project escalation evidence); missing entries rebuilt; proven gates
+// escalated. Rot is handled by the TTL sweep, not by scope-blind pruning. ---
 const idxGlobalDir = join(tmp, "idx-global")
 const idxProjectDir = join(tmp, "idx-project")
 await mkdir(idxGlobalDir, { recursive: true })
@@ -524,21 +556,29 @@ const idxGate = (key: string, signature: string): Record<string, unknown> => ({
 })
 // global store: gate dddd without an index entry + orphan index key ffff
 await writeFile(join(idxGlobalDir, "gates.json"), JSON.stringify({ version: 1, gates: [idxGate("dddd00000001", "bash:index me")] }), "utf8")
+// escalation evidence must rest on LIVE dirs (ghost dirs don't count) — use two real ones
+const idxProjA = join(tmp, "idx-escalate-a")
+const idxProjB = join(tmp, "idx-escalate-b")
+await mkdir(idxProjA, { recursive: true })
+await mkdir(idxProjB, { recursive: true })
 await writeFile(
   join(idxGlobalDir, "index.json"),
   JSON.stringify({
     version: 1,
     keys: {
       ffff00000001: { projects: ["nowhere"], lastSeen: "2026-08-20T00:00:00.000Z" },
-      eeee00000001: { projects: ["projA", "projB"], lastSeen: "2026-08-23T00:00:00.000Z" },
+      eeee00000001: { projects: [idxProjA, idxProjB], lastSeen: "2026-08-23T00:00:00.000Z" },
+      // ghost-only evidence: both dirs gone → must NOT escalate
+      abcd00000001: { projects: [join(tmp, "ghost-1"), join(tmp, "ghost-2")], lastSeen: "2026-08-23T00:00:00.000Z" },
     },
   }),
   "utf8",
 )
-// project store: gate eeee proven in 2 project dirs (per index) but never escalated
+// project store: gate eeee proven in 2 LIVE project dirs (per index) but never escalated;
+// gate abcd "proven" in 2 ghost dirs only
 await writeFile(
   join(idxProjectDir, ".opencode", "dejavu", "gates.json"),
-  JSON.stringify({ version: 1, gates: [idxGate("eeee00000001", "bash:escalate via index")] }),
+  JSON.stringify({ version: 1, gates: [idxGate("eeee00000001", "bash:escalate via index"), idxGate("abcd00000001", "bash:ghost proven")] }),
   "utf8",
 )
 const idxStores = new Stores(new GateStore(idxGlobalDir), new GateStore(join(idxProjectDir, ".opencode", "dejavu")))
@@ -546,11 +586,15 @@ await idxStores.reconcileAll()
 const idxAfter = await new GateStore(idxGlobalDir).loadIndex(true)
 const idxGlobalGates = await new GateStore(idxGlobalDir).load(true)
 const idxProjectGates = await new GateStore(join(idxProjectDir, ".opencode", "dejavu")).load(true)
-check("orphan index key pruned", idxAfter.keys["ffff00000001"] === undefined)
+check("orphan index key survives reconcile (may live in another project)", idxAfter.keys["ffff00000001"] !== undefined)
 check("missing index entry rebuilt from the global gate", idxAfter.keys["dddd00000001"] !== undefined)
 check(
-  "gate proven in 2+ projects escalates to global on reconcile",
+  "gate proven in 2+ LIVE projects escalates to global on reconcile",
   idxGlobalGates.some((g) => g.key === "eeee00000001") && !idxProjectGates.some((g) => g.key === "eeee00000001"),
+)
+check(
+  "gate proven only in ghost dirs does NOT escalate",
+  !idxGlobalGates.some((g) => g.key === "abcd00000001") && idxProjectGates.some((g) => g.key === "abcd00000001"),
 )
 
 // --- 26. multi-window: session state lives on the gate, not in a process ---
@@ -641,8 +685,8 @@ const attemptWith = (hooks: Awaited<ReturnType<typeof Dejavu>>) => async (comman
 }
 
 // --- 28. mergeGate preserves session enforcement state (escalation must not reset it) ---
-const mergeA = seedGate({ key: "aaaa11111111", remindedSessions: { s1: 100, s2: 200 }, failedSessions: { s1: 150 } }) as unknown as Gate
-const mergeB = seedGate({ key: "aaaa11111111", remindedSessions: { s2: 300, s3: 250 }, failedSessions: { s3: 260 } }) as unknown as Gate
+const mergeA = seedGate({ key: "aaaa11111111", remindedSessions: { s1: 100, s2: 200 }, failedSessions: { s1: 150 }, overrideCount: 2 }) as unknown as Gate
+const mergeB = seedGate({ key: "aaaa11111111", remindedSessions: { s2: 300, s3: 250 }, failedSessions: { s3: 260 }, overrideCount: 3, feedbackDemoted: true }) as unknown as Gate
 mergeGate(mergeA, mergeB)
 check(
   "mergeGate preserves session enforcement state",
@@ -652,6 +696,7 @@ check(
     mergeA.failedSessions?.s1 === 150 &&
     mergeA.failedSessions?.s3 === 260,
 )
+check("mergeGate sums override counts and keeps the demotion mark", mergeA.overrideCount === 5 && mergeA.feedbackDemoted === true)
 
 // --- 29. fuzzy consolidation lands on the reminded gate and keeps its evidence ---
 const fuzzyDir = join(tmp, "fuzzy-project")
@@ -726,6 +771,11 @@ await seedGates(healRetireDir, [
 await Dejavu({ directory: healRetireDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
 const healLog = await readFile(join(healRetireDir, ".opencode", "dejavu", "log.jsonl"), "utf8")
 check("corrected gate with zero recurrences retires healed", healLog.includes('"type":"retired-healed"'))
+// Deferred salient events bypass logAll, so the project store mirrors them to the
+// global forensics itself (round-8 routing) — before this, the global log never
+// saw a sweep/migrate retired-healed/demoted.
+const healGlobalLog = await readFile(join(tmp, "global", "log.jsonl"), "utf8")
+check("retired-healed (deferred, salient) is mirrored to the global log", healGlobalLog.includes(`"type":"retired-healed","key":"${patternKey(healSig)}"`))
 
 // --- 34. flag-aware fuzzy: disjoint flags never merge, short subset additions still do ---
 check("disjoint flags never fuzzy-merge", !fuzzySimilar("bash:python train.py --lr <n>", "bash:python train.py --epochs <n>"))
@@ -792,6 +842,782 @@ const healBAfter = await attemptWith(hooksH)(HEAL_CMD, "h3", "h8")
 check("healed gate no longer reminds", healBAfter === null)
 const healBLog = await readFile(join(healBDir, ".opencode", "dejavu", "log.jsonl"), "utf8")
 check("heal event logged", healBLog.includes('"type":"healed"'))
+
+// --- 38. PowerShell one-liners: call operator + quoted exe path + here-string ---
+const PS_A = '& "C:\\venv\\python.exe" -c @"print(\'alpha\')"@'
+const PS_B = '& "C:\\venv\\python.exe" -c @"print(\'beta\')"@'
+const sigPSA = callSignature("bash", { command: PS_A }) ?? ""
+const sigPSB = callSignature("bash", { command: PS_B }) ?? ""
+check("powershell here-string payload is fingerprinted, @ markers gone", sigPSA.includes("<code:") && !sigPSA.includes("@"))
+check("different here-string code gets different keys", sigPSA !== sigPSB)
+check("fingerprinted powershell one-liner can block", canBlock("bash", sigPSA))
+
+// --- 39. cmd /c unwrap: the payload IS the call ---
+check(
+  "cmd /c unwraps to the inner command (one identity, wrapper invisible)",
+  callSignature("bash", { command: 'cmd /c "gradlew.bat :onyx-app:test"' }) === callSignature("bash", { command: "gradlew.bat :onyx-app:test" }),
+)
+check(
+  "unwrapped cmd /c gradle test reaches the diagnostic tier",
+  canRemind("bash", callSignature("bash", { command: 'cmd /c "gradlew.bat test"' }) ?? ""),
+)
+check("legacy cmd <path> <str> shape never enforces", !canBlock("bash", "bash:cmd <path> <str>") && !canRemind("bash", "bash:cmd <path> <str>"))
+
+// --- 40. residual identity guard: over-generic shapes never enforce ---
+check("wrapper verb with all-parameterized args cannot block", !canBlock("bash", "bash:node <str> <n> >& <n>"))
+check("chain with unknown head keeps the identity of later segments", canRemind("bash", "bash:<str> ; mypy stitch_backend <n> >& <n>"))
+check("plumbing-only segment carries no identity", !hasResidualIdentity("bash:select-object -last <n>"))
+check("concrete commands keep their teeth", canBlock("bash", "bash:wc -l <str>") && canBlock("bash", "bash:node scripts/run.mjs <n> >& <n>"))
+check(
+  "guard generalizes the legacy bare-one-liner rule",
+  !hasResidualIdentity("bash:& <str> -c @ <str> @") && hasResidualIdentity("bash:python -c <code:14021754>"),
+)
+
+// --- 41. terminal control chars never reach disk ---
+const ANSI_CMD = "ansi colored failure cmd"
+await after(
+  { tool: "bash", sessionID: "s70", callID: "a1", args: { command: ANSI_CMD } } as unknown as AfterInput,
+  { title: ANSI_CMD, output: "\u001b[31;1mFATAL: boom\u001b[0m", metadata: {} } as unknown as AfterOutput,
+)
+gates = await readGates()
+const ansiGate = gates.find((g) => g.signature === `bash:${ANSI_CMD}`)
+check("ANSI escapes stripped from persisted snippet", ansiGate !== undefined && !ansiGate.snippet.includes("\u001b") && ansiGate.snippet.includes("FATAL: boom"))
+
+// --- 42. mypy is diagnostic: remind-only, never blocking ---
+const MYPY = "mypy stitch_backend"
+await fail(MYPY, "s80", "m1")
+await fail(MYPY, "s80", "m2")
+await fail(MYPY, "s81", "m3")
+gates = await readGates()
+check("mypy promotes to remind-only (diagnostic)", gates.find((g) => g.signature === `bash:${MYPY}`)?.status === "reminding")
+
+// --- 43. noise: empty search results and dismissed questions are not failures ---
+await emitToolError("noise3", "grep_app_searchGitHub", "s90", "No results found for your query.\n\nIMPORTANT: literal code patterns only")
+await emitToolError("noise4", "question", "s91", "The user dismissed this question")
+gates = await readGates()
+check("empty search result is noise, not a failure", !gates.some((g) => g.tool === "grep_app_searchGitHub"))
+check("dismissed question is noise, not a failure", !gates.some((g) => g.tool === "question"))
+
+// --- 44. feedback demotion by recurrence: an untaught gate surrenders ---
+// Votes are post-REMINDER failures: each session is reminded first, then
+// reoffends — failures the gate actually had a chance to prevent.
+const fbDir = join(tmp, "feedback-project")
+const FB_CMD = "deploy --to feedback"
+const fbKey = patternKey(callSignature("bash", { command: FB_CMD }) ?? "")
+await seedGates(fbDir, [seedGate({ key: fbKey, signature: `bash:${FB_CMD}` })])
+const hooksFB = await Dejavu({ directory: fbDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+for (const s of ["fb1", "fb2", "fb3"]) {
+  await attemptWith(hooksFB)(FB_CMD, s, `${s}-remind`)
+  await failOn(hooksFB)(FB_CMD, s, `${s}-fail`)
+}
+let fbGates = await readJson(join(fbDir, ".opencode", "dejavu", "gates.json"))
+const fbGate = fbGates.find((g) => g.key === fbKey)
+check("enforced gate demoted after repeated post-reminder failures", fbGate?.status === "watching" && fbGate?.feedbackDemoted === true)
+await failOn(hooksFB)(FB_CMD, "fb4", "fb4")
+await failOn(hooksFB)(FB_CMD, "fb5", "fb5")
+await failOn(hooksFB)(FB_CMD, "fb6", "fb6")
+fbGates = await readJson(join(fbDir, ".opencode", "dejavu", "gates.json"))
+check("feedback-demoted gate never re-promotes mechanically", fbGates.find((g) => g.key === fbKey)?.status === "watching")
+check("demotion is logged", (await readFile(join(fbDir, ".opencode", "dejavu", "log.jsonl"), "utf8")).includes('"type":"demoted"'))
+
+// --- 45. feedback demotion by overrides: a bypassed gate surrenders ---
+const ovDir = join(tmp, "override-project")
+const OV_CMD = "deploy --to override"
+const ovKey = patternKey(callSignature("bash", { command: OV_CMD }) ?? "")
+await seedGates(ovDir, [seedGate({ key: ovKey, signature: `bash:${OV_CMD}` })])
+const hooksOV = await Dejavu({ directory: ovDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+for (let i = 0; i < DEMOTE_OVERRIDES; i++) {
+  await attemptWith(hooksOV)(`${OV_CMD} # dejavu:proceed`, `ov${i}`, `ov${i}`)
+}
+const ovGates = await readJson(join(ovDir, ".opencode", "dejavu", "gates.json"))
+const ovGate = ovGates.find((g) => g.key === ovKey)
+check("overrides are counted on the gate", ovGate?.overrideCount === DEMOTE_OVERRIDES)
+check("gate demoted after repeated explicit bypasses", ovGate?.status === "watching" && ovGate?.feedbackDemoted === true)
+check("demoted gate no longer interrupts", (await attemptWith(hooksOV)(OV_CMD, "ov9", "ov9")) === null)
+
+// --- 45b. below-threshold overrides do NOT demote; baseline gives re-enforced gates a grace window ---
+const graceDir = join(tmp, "grace-project")
+const GRACE_CMD = "deploy --to grace"
+const graceKey = patternKey(callSignature("bash", { command: GRACE_CMD }) ?? "")
+await seedGates(graceDir, [seedGate({ key: graceKey, signature: `bash:${GRACE_CMD}` })])
+const hooksGR = await Dejavu({ directory: graceDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+for (let i = 0; i < DEMOTE_OVERRIDES - 1; i++) {
+  await attemptWith(hooksGR)(`${GRACE_CMD} # dejavu:proceed`, `gr${i}`, `gr${i}`)
+}
+let graceGates = await readJson(join(graceDir, ".opencode", "dejavu", "gates.json"))
+check("overrides below threshold keep the gate enforced", graceGates.find((g) => g.key === graceKey)?.status === "blocking")
+// Human re-enforces a previously demoted gate: the stale counters must not re-demotion instantly
+await seedGates(graceDir, [
+  seedGate({
+    key: graceKey,
+    signature: `bash:${GRACE_CMD}`,
+    status: "blocking",
+    recurredAfterGate: 3,
+    overrideCount: 0,
+    feedbackBaseline: { recurred: 3, overrides: 0 },
+  }),
+])
+const hooksGR2 = await Dejavu({ directory: graceDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+await failOn(hooksGR2)(GRACE_CMD, "grx1", "grx1")
+graceGates = await readJson(join(graceDir, ".opencode", "dejavu", "gates.json"))
+check("re-enforced gate gets a fresh grace window (baseline offsets stale counters)", graceGates.find((g) => g.key === graceKey)?.status === "blocking")
+// Exhaust the fresh window with post-reminder reoffenses across sessions
+for (const s of ["grx2", "grx3"]) {
+  await attemptWith(hooksGR2)(GRACE_CMD, s, `${s}-remind`)
+  await failOn(hooksGR2)(GRACE_CMD, s, `${s}-fail`)
+}
+graceGates = await readJson(join(graceDir, ".opencode", "dejavu", "gates.json"))
+check("re-enforced gate demotes again once the fresh window is exhausted", graceGates.find((g) => g.key === graceKey)?.status === "watching")
+
+// --- 46. migrate catch-up: gates already past the threshold demote on init ---
+const catchDir = join(tmp, "catchup-project")
+const catchSig = callSignature("bash", { command: "catch up cmd" }) ?? ""
+await seedGates(catchDir, [seedGate({ key: patternKey(catchSig), signature: catchSig, recurredAfterGate: 3, reoffenseSessions: ["c1", "c2"] })])
+await Dejavu({ directory: catchDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+const catchGates = await readJson(join(catchDir, ".opencode", "dejavu", "gates.json"))
+const catchGate = catchGates.find((g) => g.key === patternKey(catchSig))
+check("migrate demotes gates already past the recurrence threshold", catchGate?.status === "watching" && catchGate?.feedbackDemoted === true)
+
+// --- 47. cmd wrapper variants and composition ---
+check(
+  "cmd /k and cmd.exe /s /c unwrap identically",
+  callSignature("bash", { command: "cmd /k build.bat" }) === callSignature("bash", { command: "build.bat" }) &&
+    callSignature("bash", { command: 'cmd.exe /s /c "build.bat"' }) === callSignature("bash", { command: "build.bat" }),
+)
+const cmdPy = callSignature("bash", { command: 'cmd /c python -c "print(\'x\')"' }) ?? ""
+check("cmd /c around an interpreter one-liner unwraps AND fingerprints", cmdPy.startsWith("bash:python -c <code:") && canBlock("bash", cmdPy))
+check("cmd unwrap is idempotent", normalizeCommand(normalizeCommand("cmd /c gradlew test")) === normalizeCommand("cmd /c gradlew test"))
+check("cmd without /c is not unwrapped", (callSignature("bash", { command: "cmd something" }) ?? "").startsWith("bash:cmd something"))
+check(
+  "chain segments unwrap cmd /c individually (bypass protection keeps working)",
+  bashSegmentSignatures("echo ok && cmd /c gradlew test").includes("bash:gradlew test"),
+)
+
+// --- 48. control chars: commands, error text, historical gate data ---
+check(
+  "commands carrying ANSI normalize to the clean form",
+  callSignature("bash", { command: "\u001b[32mgit status\u001b[0m" }) === callSignature("bash", { command: "git status" }),
+)
+check("parameterizeError strips control chars", !parameterizeError("\u001b[31mENOENT: no such file\u001b[0m").includes("\u001b"))
+check("stripControl keeps structure (LF/TAB) but drops escapes and NUL", stripControl("a\u001b[31mb\u0000c\td\ne") === "abc\td\ne")
+const ansiHistDir = join(tmp, "ansi-history-project")
+const ansiHistSig = callSignature("bash", { command: "legacy ansi cmd" }) ?? ""
+await seedGates(ansiHistDir, [
+  seedGate({
+    key: patternKey(ansiHistSig),
+    signature: ansiHistSig,
+    status: "watching",
+    snippet: "\u001b[31mold red error\u001b[0m",
+    correction: "fix: \u001b[33mthe thing\u001b[0m",
+  }),
+])
+await Dejavu({ directory: ansiHistDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+const ansiHistGate = (await readJson(join(ansiHistDir, ".opencode", "dejavu", "gates.json"))).find((g) => g.key === patternKey(ansiHistSig))
+check(
+  "historical gates are sanitized on init (snippet + correction)",
+  ansiHistGate !== undefined && !ansiHistGate.snippet.includes("\u001b") && !(ansiHistGate.correction ?? "").includes("\u001b") && ansiHistGate.snippet.includes("old red error"),
+)
+
+// --- 49. doctor discovers project stores from the global index ---
+const docGlobal = join(tmp, "doctor-global")
+const docProject = join(tmp, "doctor-project")
+await mkdir(docGlobal, { recursive: true })
+await mkdir(join(docProject, ".opencode", "dejavu"), { recursive: true })
+await writeFile(join(docGlobal, "gates.json"), JSON.stringify({ version: 1, gates: [] }), "utf8")
+await writeFile(join(docProject, ".opencode", "dejavu", "gates.json"), JSON.stringify({ version: 1, gates: [] }), "utf8")
+await writeFile(
+  join(docGlobal, "index.json"),
+  JSON.stringify({ version: 1, keys: { abcdef123456: { projects: [docProject], lastSeen: new Date().toISOString() } } }),
+  "utf8",
+)
+const repoRoot = fileURLToPath(new URL("..", import.meta.url))
+const doctorRun = spawnSync(process.execPath, [join(repoRoot, "scripts", "doctor.ts")], {
+  env: { ...process.env, DEJAVU_HOME: docGlobal },
+  encoding: "utf8",
+})
+const doctorOut = doctorRun.stdout
+check("doctor without args discovers project stores from the index", doctorOut.includes("discovered 1 project store(s)"))
+check("doctor report covers the discovered project scope", doctorOut.includes(docProject))
+
+// --- 50. interpreter flag spellings converge (alternation order matters) ---
+check(
+  "pwsh -Command and -c with the same payload normalize to one signature",
+  callSignature("bash", { command: 'pwsh -Command "Get-Thing"' }) === callSignature("bash", { command: 'pwsh -c "Get-Thing"' }),
+)
+check(
+  "powershell -EncodedCommand converges with -c (no swallowed flag-name debris)",
+  callSignature("bash", { command: "powershell -EncodedCommand aGVsbG8=" }) === callSignature("bash", { command: "powershell -c aGVsbG8=" }) &&
+    !(callSignature("bash", { command: 'pwsh -Command "Get-Thing"' }) ?? "").includes("-c<code:"),
+)
+const PY_LAUNCH_A = 'py -3 -c "import alpha"'
+const PY_LAUNCH_B = 'py -3 -c "import beta"'
+const pyLaunchSig = callSignature("bash", { command: PY_LAUNCH_A }) ?? ""
+check("windows py launcher one-liners are fingerprinted (not flattened)", pyLaunchSig.includes("<code:") && !pyLaunchSig.includes("<str>"))
+check("different py launcher payloads get different keys", pyLaunchSig !== callSignature("bash", { command: PY_LAUNCH_B }))
+
+// --- 51. guard bypasses closed: -m modules, shell builtins heading chains ---
+check("python -m <str> (quoted module) carries no identity", !canBlock("bash", "bash:python -m <str>") && !canRemind("bash", "bash:python -m <str>"))
+check("python -m with a literal module keeps identity", canBlock("bash", "bash:python -m http.server <n>"))
+check("cd heading a fully-parameterized chain grants no identity", !canBlock("bash", "bash:cd <path> && python <path>"))
+check("bare cd <path> never enforces", !hasResidualIdentity("bash:cd <path>"))
+
+// --- 52. cmd /c inner chains: gates fire through the wrapper; marker visible ---
+const INNER_CMD = "inner gated deploy run"
+await fail(INNER_CMD, "in1", "in1")
+await fail(INNER_CMD, "in1", "in2")
+await fail(INNER_CMD, "in2", "in3")
+gates = await readGates()
+check("inner-chain fixture promoted", gates.some((g) => g.signature === `bash:${INNER_CMD}` && g.status === "blocking"))
+check(
+  "segment expansion unfolds cmd /c payloads (inner chain visible)",
+  bashSegmentSignatures(`cmd /c "echo ok && ${INNER_CMD}"`).includes(`bash:${INNER_CMD}`),
+)
+const viaWrapper = await attempt(`cmd /c "echo ok && ${INNER_CMD}"`, "in3", "in4")
+check("gate fires through a cmd /c inner chain", viaWrapper !== null && viaWrapper.message.includes("[dejavu] REMINDER"))
+const markerThroughWrapper = await attempt(`cmd /c "${INNER_CMD} # dejavu:proceed"`, "in3", "in5")
+check("override marker inside a leading cmd /c payload is honored", markerThroughWrapper === null)
+check(
+  "marker smuggled in INNER quotes of a cmd payload still does not bypass",
+  (await attempt(`cmd /c "echo \\"dejavu:proceed\\" && ${INNER_CMD}"`, "in4", "in6")) !== null,
+)
+
+// --- 53. over-generic shapes never fuzzy-match concrete gates ---
+const fuzzyGuardDir = join(tmp, "fuzzy-guard-project")
+const concreteSig = "bash:node abcdefgh <n> | select-object -last <n>"
+await seedGates(fuzzyGuardDir, [seedGate({ key: patternKey(concreteSig), signature: concreteSig })])
+const hooksFG = await Dejavu({ directory: fuzzyGuardDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+const genericSig = callSignature("bash", { command: 'node "whatever" 5 | Select-Object -Last 20' }) ?? ""
+check("test fixture really would fuzzy-match without the guard", fuzzySimilar(genericSig, concreteSig))
+check("over-generic incoming signature has no residual identity", !hasResidualIdentity(genericSig))
+check("over-generic incoming signature does not enforce via fuzzy", (await attemptWith(hooksFG)('node "whatever" 5 | Select-Object -Last 20', "fg1", "fg1")) === null)
+await failOn(hooksFG)('node "whatever" 5 | Select-Object -Last 20', "fg2", "fg2")
+const fgGates = await readJson(join(fuzzyGuardDir, ".opencode", "dejavu", "gates.json"))
+check("over-generic failure does not consolidate into the concrete gate", fgGates.find((g) => g.key === patternKey(concreteSig))?.count === 3)
+
+// --- 54. concurrency hammer: two instances, parallel failures, one store ---
+const hammerDir = join(tmp, "hammer-project")
+const hooksHM1 = await Dejavu({ directory: hammerDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+const hooksHM2 = await Dejavu({ directory: hammerDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+const HAMMER_CMD = "hammer shared load cmd"
+const hammerFail = (hooks: Awaited<ReturnType<typeof Dejavu>>) => (session: string, callID: string): Promise<void> =>
+  (hooks["tool.execute.after"] as AfterHook)(
+    { tool: "bash", sessionID: session, callID, args: { command: HAMMER_CMD } } as unknown as AfterInput,
+    { title: HAMMER_CMD, output: "npm ERR! boom\nExit code: 1", metadata: {} } as unknown as AfterOutput,
+  )
+const hammerJobs: Promise<void>[] = []
+for (let i = 0; i < 12; i++) {
+  hammerJobs.push(hammerFail(hooksHM1)(`hm-${i % 3}`, `hm1-${i}`))
+  hammerJobs.push(hammerFail(hooksHM2)(`hm-${i % 3}`, `hm2-${i}`))
+}
+await Promise.all(hammerJobs)
+const hammerGates = await readJson(join(hammerDir, ".opencode", "dejavu", "gates.json"))
+check("concurrent failures from two instances lose no updates", hammerGates.find((g) => g.signature === `bash:${HAMMER_CMD}`)?.count === 24)
+const hammerLog = (await readFile(join(hammerDir, ".opencode", "dejavu", "log.jsonl"), "utf8")).split("\n").filter((l) => l.trim() !== "")
+check(
+  "concurrent log appends stay parseable",
+  hammerLog.length > 0 &&
+    hammerLog.every((l) => {
+      try {
+        JSON.parse(l)
+        return true
+      } catch {
+        return false
+      }
+    }),
+)
+
+// --- 55. root B-2: a success clears the session's remind→block chain ---
+const chainDir = join(tmp, "chain-reset-project")
+const CHAIN_CMD = "chain reset deploy cmd"
+const chainSig = callSignature("bash", { command: CHAIN_CMD }) ?? ""
+const chainKey = patternKey(chainSig)
+await seedGates(chainDir, [seedGate({ key: chainKey, signature: chainSig })])
+const hooksCH = await Dejavu({ directory: chainDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+check("chain fixture: first attempt reminds", (await attemptWith(hooksCH)(CHAIN_CMD, "ch-ses", "ch1"))?.message.includes("[dejavu] REMINDER") === true)
+await new Promise((resolve) => setTimeout(resolve, 600))
+await failOn(hooksCH)(CHAIN_CMD, "ch-ses", "ch2") // retry fails -> failedSessions[ch-ses]
+check("chain fixture: repeat offense blocks", (await attemptWith(hooksCH)(CHAIN_CMD, "ch-ses", "ch3"))?.message.includes("[dejavu] BLOCKED") === true)
+await (hooksCH["tool.execute.after"] as AfterHook)(
+  { tool: "bash", sessionID: "ch-ses", callID: "ch4", args: { command: CHAIN_CMD } } as unknown as AfterInput,
+  { title: CHAIN_CMD, output: "ok", metadata: { exit: 0 } } as unknown as AfterOutput,
+)
+const chainGate = (await readJson(join(chainDir, ".opencode", "dejavu", "gates.json"))).find((g) => g.key === chainKey)
+check("success clears failedSessions for the session", chainGate?.failedSessions?.["ch-ses"] === undefined)
+check("success clears remindedSessions for the session", chainGate?.remindedSessions?.["ch-ses"] === undefined)
+check("session unblocked after proving the fix (remind, not block)", (await attemptWith(hooksCH)(CHAIN_CMD, "ch-ses", "ch5"))?.message.includes("[dejavu] REMINDER") === true)
+
+// --- 56. iteration runners remind but never block ---
+const iterDir = join(tmp, "iteration-project")
+const hooksIT = await Dejavu({ directory: iterDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+const DART_RUN = "dart run scripts/gen_tags.dart"
+await failOn(hooksIT)(DART_RUN, "it1", "it1")
+await failOn(hooksIT)(DART_RUN, "it1", "it2")
+await failOn(hooksIT)(DART_RUN, "it2", "it3")
+const itGates = await readJson(join(iterDir, ".opencode", "dejavu", "gates.json"))
+check("dart run promotes to remind-only (iteration verb)", itGates.find((g) => g.signature === `bash:${DART_RUN}`)?.status === "reminding")
+check("reminding-tier reminder says it never blocks", (await attemptWith(hooksIT)(DART_RUN, "it3", "it4"))?.message.includes("never blocks") === true)
+
+// --- 57. overrides of reminding gates are not counted toward demotion ---
+const ovRemDir = join(tmp, "override-reminding-project")
+const OV_REM_SIG = "bash:pytest tests/test_x.py"
+await seedGates(ovRemDir, [seedGate({ key: patternKey(OV_REM_SIG), signature: OV_REM_SIG, status: "reminding" })])
+const hooksOR = await Dejavu({ directory: ovRemDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+for (let i = 0; i < DEMOTE_OVERRIDES + 1; i++) {
+  await attemptWith(hooksOR)(`pytest tests/test_x.py # dejavu:proceed`, `or${i}`, `or${i}`)
+}
+const orGates = await readJson(join(ovRemDir, ".opencode", "dejavu", "gates.json"))
+const orGate = orGates.find((g) => g.key === patternKey(OV_REM_SIG))
+check("reminding-tier overrides are not counted on the gate", orGate?.overrideCount === 0)
+check("reminding gate survives mass overrides (no demotion)", orGate?.status === "reminding" && orGate?.feedbackDemoted !== true)
+
+// --- 58. index churn gate: first-ever failure is not indexed, the second is ---
+const idxGateDir = join(tmp, "index-gate-project")
+const hooksIG = await Dejavu({ directory: idxGateDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+const IDX_CMD = "index gate probe cmd"
+const idxKey = patternKey(callSignature("bash", { command: IDX_CMD }) ?? "")
+await failOn(hooksIG)(IDX_CMD, "ig1", "ig1")
+const idxAfterOne = JSON.parse(await readFile(join(tmp, "global", "index.json"), "utf8")) as { keys: Record<string, unknown> }
+check("first-ever failure of a new pattern is not indexed", idxAfterOne.keys[idxKey] === undefined)
+await failOn(hooksIG)(IDX_CMD, "ig1", "ig2")
+const idxAfterTwo = JSON.parse(await readFile(join(tmp, "global", "index.json"), "utf8")) as { keys: Record<string, unknown> }
+check("second failure indexes the pattern (escalation stays alive)", idxAfterTwo.keys[idxKey] !== undefined)
+
+// --- 59. garbage dates cannot make a gate immortal ---
+const dateDir = join(tmp, "dates-project")
+const dateSig = callSignature("bash", { command: "garbage dates cmd" }) ?? ""
+await seedGates(dateDir, [seedGate({ key: patternKey(dateSig), signature: dateSig, firstSeen: "not-a-date", lastSeen: "also-garbage" })])
+await Dejavu({ directory: dateDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+const dateGate = (await readJson(join(dateDir, ".opencode", "dejavu", "gates.json"))).find((g) => g.key === patternKey(dateSig))
+check("unparseable dates reset to a real date (no immortal gates)", dateGate !== undefined && !Number.isNaN(Date.parse(dateGate.firstSeen)) && !Number.isNaN(Date.parse(dateGate.lastSeen)))
+
+// --- 60. doctor --repair prunes true orphans (it sees every scope) ---
+const orphanKey = "deadbeef0123"
+const idxPath = join(docGlobal, "index.json")
+const idxDoc = JSON.parse(await readFile(idxPath, "utf8")) as { keys: Record<string, unknown> }
+idxDoc.keys[orphanKey] = { projects: [docProject], lastSeen: new Date().toISOString() }
+await writeFile(idxPath, JSON.stringify(idxDoc), "utf8")
+spawnSync(process.execPath, [join(repoRoot, "scripts", "doctor.ts"), "--repair"], {
+  env: { ...process.env, DEJAVU_HOME: docGlobal },
+  encoding: "utf8",
+})
+const idxRepaired = JSON.parse(await readFile(idxPath, "utf8")) as { keys: Record<string, unknown> }
+check("doctor --repair prunes true-orphan index keys", idxRepaired.keys[orphanKey] === undefined)
+
+// --- 61. migrate never re-promotes feedback-demoted gates ---
+const reDemoDir = join(tmp, "remigrate-project")
+const RE_DEMO_SIG = "bash:pytest tests/test_redemo.py"
+await seedGates(reDemoDir, [
+  seedGate({
+    key: patternKey(RE_DEMO_SIG),
+    signature: RE_DEMO_SIG,
+    status: "watching",
+    feedbackDemoted: true,
+    feedbackBaseline: { recurred: 3, overrides: 0 },
+    recurredAfterGate: 3,
+  }),
+])
+await Dejavu({ directory: reDemoDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+const reDemoGates = await readJson(join(reDemoDir, ".opencode", "dejavu", "gates.json"))
+check("migrate does not re-promote feedback-demoted gates", reDemoGates.find((g) => g.key === patternKey(RE_DEMO_SIG))?.status === "watching")
+
+// --- 61b. migrate never re-promotes a retired (retireBaseline) gate — the
+// damping invariant ("re-promotion needs a fresh bar") must hold on EVERY
+// mechanical path, not just recordFailure. Without the exemption a healed
+// diagnostic gate's lifetime count clears the catch-up bar and re-promotes on
+// every migrate, re-opening the promote→heal→promote oscillation. ---
+const migHealDir = join(tmp, "migrate-heal-project")
+const MIG_HEAL_SIG = "bash:pytest tests/test_migheal.py"
+await seedGates(migHealDir, [
+  seedGate({
+    key: patternKey(MIG_HEAL_SIG),
+    signature: MIG_HEAL_SIG,
+    status: "watching",
+    count: 3,
+    sessions: ["mh1", "mh2"],
+    retireBaseline: { count: 3 },
+  }),
+])
+await Dejavu({ directory: migHealDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+const migHealGates = await readJson(join(migHealDir, ".opencode", "dejavu", "gates.json"))
+check("migrate does not re-promote a retired (retireBaseline) gate", migHealGates.find((g) => g.key === patternKey(MIG_HEAL_SIG))?.status === "watching")
+
+// --- 62. success heals/clears only on exact match (no proxy healing) ---
+const proxyDir = join(tmp, "proxy-success-project")
+const PROXY_SIG = "bash:deploy --to alpha"
+await seedGates(proxyDir, [seedGate({ key: patternKey(PROXY_SIG), signature: PROXY_SIG })])
+const hooksPX = await Dejavu({ directory: proxyDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+const proxyVariant = callSignature("bash", { command: "deploy --to beta" }) ?? ""
+check("fixture variant really is fuzzy-similar to the gated command", fuzzySimilar(proxyVariant, PROXY_SIG))
+await (hooksPX["tool.execute.after"] as AfterHook)(
+  { tool: "bash", sessionID: "px1", callID: "px1", args: { command: "deploy --to beta" } } as unknown as AfterInput,
+  { title: "deploy", output: "ok", metadata: { exit: 0 } } as unknown as AfterOutput,
+)
+const pxGate = (await readJson(join(proxyDir, ".opencode", "dejavu", "gates.json"))).find((g) => g.key === patternKey(PROXY_SIG))
+check("fuzzy proxy success does not heal or clear chains", (pxGate?.succeededAfterGate ?? 0) === 0 && pxGate?.status === "blocking")
+
+// --- 63. override marker requires comment syntax (no smuggling as data) ---
+check("unquoted marker smuggled into a chain segment does not bypass", (await attempt(`echo dejavu:proceed && ${CMD}`, "sm1", "sm1")) !== null)
+check("bare marker without '#' does not bypass", (await attempt(`${CMD} dejavu:proceed`, "sm2", "sm2")) !== null)
+check("comment-form marker still bypasses", (await attempt(`${CMD} # dejavu:proceed`, "sm3", "sm3")) === null)
+
+// --- 64. exit-1 immunity requires every chain segment to be diagnostic ---
+check("mixed chain loses exit-1 immunity (deploy failure not hidden by grep)", !isIntendedNonzero("deploy --broken && grep done log.txt", 1))
+check("all-diagnostic chain keeps exit-1 immunity", isIntendedNonzero("grep a file && grep b file", 1))
+check("single diagnostic command keeps exit-1 immunity", isIntendedNonzero("grep foo bar.txt", 1))
+check("exit 2 is never intended", !isIntendedNonzero("grep foo bar.txt", 2))
+
+// --- 65. taught retirement: clean reminders retire the gate softly ---
+const taughtDir = join(tmp, "taught-project")
+const TAUGHT_CMD = "taught retirement cmd"
+const taughtKey = patternKey(callSignature("bash", { command: TAUGHT_CMD }) ?? "")
+await seedGates(taughtDir, [seedGate({ key: taughtKey, signature: `bash:${TAUGHT_CMD}`, remindedCount: 4 })])
+const hooksTA = await Dejavu({ directory: taughtDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+const taughtRemind = await attemptWith(hooksTA)(TAUGHT_CMD, "ta1", "ta1")
+check("the retirement reminder is still delivered", taughtRemind !== null && taughtRemind.message.includes("[dejavu] REMINDER"))
+check("gate with 5 clean reminders retires to watching (taught)", (await readJson(join(taughtDir, ".opencode", "dejavu", "gates.json"))).find((g) => g.key === taughtKey)?.status === "watching")
+check("retirement logged as retired-taught", (await readFile(join(taughtDir, ".opencode", "dejavu", "log.jsonl"), "utf8")).includes('"type":"retired-taught"'))
+check("retired gate no longer reminds", (await attemptWith(hooksTA)(TAUGHT_CMD, "ta2", "ta2")) === null)
+
+// --- 66. env-prefixed interpreter one-liners are fingerprinted ---
+const envSig = callSignature("bash", { command: 'PYTHONPATH=x python -c "print(1)"' }) ?? ""
+check("env-prefixed one-liner is fingerprinted, not flattened", envSig.includes("<code:") && !envSig.includes("<str>"))
+
+// --- 67. mergeGate preserves the reminding tier ---
+const rankTarget = seedGate({ key: "aaaa22222222", status: "watching" }) as unknown as Gate
+const rankSource = seedGate({ key: "aaaa22222222", status: "reminding" }) as unknown as Gate
+mergeGate(rankTarget, rankSource)
+check("mergeGate preserves the reminding tier", rankTarget.status === "reminding")
+
+// --- 68. flood guard evicts feedback-demoted dead weight first, visibly ---
+const floodDir = join(tmp, "flood-project")
+const floodSeed: Record<string, unknown>[] = []
+for (let i = 0; i < 2000; i++) {
+  floodSeed.push(
+    seedGate({
+      key: i.toString(16).padStart(12, "0"),
+      signature: `bash:flood filler cmd ${i}`,
+      status: "watching",
+      count: i === 0 ? 99 : 3,
+      ...(i === 0 ? { feedbackDemoted: true } : {}),
+    }),
+  )
+}
+await seedGates(floodDir, floodSeed)
+const hooksFL = await Dejavu({ directory: floodDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+await failOn(hooksFL)("flood new pattern cmd", "fl1", "fl1")
+const flGates = await readJson(join(floodDir, ".opencode", "dejavu", "gates.json"))
+check("flood guard evicts the feedback-demoted gate first", !flGates.some((g) => g.key === "000000000000") && flGates.some((g) => g.signature === "bash:flood new pattern cmd"))
+check("low-count teaching gate survives the eviction", flGates.some((g) => g.key === "000000000001"))
+check("eviction is logged", (await readFile(join(floodDir, ".opencode", "dejavu", "log.jsonl"), "utf8")).includes("flood guard evicted"))
+check("store stays at the cap", flGates.length === 2000)
+
+// --- 69. log rotation truncates oversized logs ---
+const rotDir = join(tmp, "rotate-project")
+await mkdir(rotDir, { recursive: true })
+const bigLog = Array.from({ length: 1200 }, (_, i) => JSON.stringify({ ts: "2026-08-30T00:00:00.000Z", type: "detected", key: "k", pad: "x".repeat(400), i })).join("\n") + "\n"
+await writeFile(join(rotDir, "log.jsonl"), bigLog, "utf8")
+await new Stores(new GateStore(join(tmp, "rotate-global")), new GateStore(rotDir)).rotateLogs()
+const rotLines = (await readFile(join(rotDir, "log.jsonl"), "utf8")).split("\n").filter((l) => l.trim() !== "")
+check("rotateLog truncates an oversized log to the kept window", rotLines.length > 0 && rotLines.length <= 1000)
+
+// --- 70. forgetSession clears persisted session state ---
+const forgetDir = join(tmp, "forget-project")
+const forgetSig = callSignature("bash", { command: "forget session cmd" }) ?? ""
+await seedGates(forgetDir, [seedGate({ key: patternKey(forgetSig), signature: forgetSig, remindedSessions: { "fs-ses": Date.now() }, failedSessions: { "fs-ses": Date.now() } })])
+await new Stores(new GateStore(join(tmp, "forget-global")), new GateStore(join(forgetDir, ".opencode", "dejavu"))).forgetSession("fs-ses")
+const forgetGate = (await readJson(join(forgetDir, ".opencode", "dejavu", "gates.json")))[0]
+check("forgetSession clears session state from the gate", forgetGate?.remindedSessions === undefined && forgetGate?.failedSessions === undefined)
+
+// --- 71. lock contention degrades to unlocked after the wait window (logged) ---
+const degradeDir = join(tmp, "degrade-project")
+await seedGates(degradeDir, [seedGate({ key: "deadbeefdead", signature: "bash:degrade probe cmd", status: "watching", count: 1, sessions: ["d0"] })])
+const hooksDG = await Dejavu({ directory: degradeDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+await writeFile(join(degradeDir, ".opencode", "dejavu", "gates.json.lock"), "999999", "utf8")
+await failOn(hooksDG)("degrade probe cmd", "dg1", "dg1")
+check("lock contention degrades to unlocked after the wait window (logged)", (await readFile(join(degradeDir, ".opencode", "dejavu", "log.jsonl"), "utf8")).includes('"type":"degraded"'))
+await rm(join(degradeDir, ".opencode", "dejavu", "gates.json.lock"), { force: true })
+
+// --- 72. race-burst reminders do not count toward taught retirement ---
+const burstDir = join(tmp, "burst-project")
+const BURST_CMD = "burst race cmd"
+const burstKey = patternKey(callSignature("bash", { command: BURST_CMD }) ?? "")
+await seedGates(burstDir, [seedGate({ key: burstKey, signature: `bash:${BURST_CMD}`, remindedCount: 3 })])
+const hooksBU = await Dejavu({ directory: burstDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+const burstResults: (Error | null)[] = []
+for (let i = 0; i < 5; i++) burstResults.push(await attemptWith(hooksBU)(BURST_CMD, "bu-ses", `bu${i}`))
+const burstGate = (await readJson(join(burstDir, ".opencode", "dejavu", "gates.json"))).find((g) => g.key === burstKey)
+check("race-burst calls all get reminded", burstResults.every((r) => r !== null && r.message.includes("REMINDER")))
+check("race-burst counts only the true first encounter", burstGate?.remindedCount === 4)
+check("race-burst does not retire the gate", burstGate?.status === "blocking")
+
+// --- 73. re-promotion starts a fresh lifecycle (no retire/re-promote oscillation) ---
+const cycleDir = join(tmp, "cycle-project")
+const CYCLE_CMD = "cycle lifecycle cmd"
+const cycleKey = patternKey(callSignature("bash", { command: CYCLE_CMD }) ?? "")
+const hooksCY = await Dejavu({ directory: cycleDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+await failOn(hooksCY)(CYCLE_CMD, "cy1", "cy1")
+await failOn(hooksCY)(CYCLE_CMD, "cy1", "cy2")
+await failOn(hooksCY)(CYCLE_CMD, "cy2", "cy3")
+for (let i = 4; i <= 6; i++) {
+  await (hooksCY["tool.execute.after"] as AfterHook)(
+    { tool: "bash", sessionID: `cy${i}`, callID: `cy${i}`, args: { command: CYCLE_CMD } } as unknown as AfterInput,
+    { title: CYCLE_CMD, output: "ok", metadata: { exit: 0 } } as unknown as AfterOutput,
+  )
+}
+check("lifecycle 1 heals to watching", (await readJson(join(cycleDir, ".opencode", "dejavu", "gates.json"))).find((g) => g.key === cycleKey)?.status === "watching")
+// Oscillation damping: one failure after heal must NOT re-promote (the gate
+// keeps its lifetime count, which alone would clear the bar).
+await failOn(hooksCY)(CYCLE_CMD, "cy7", "cy7")
+check(
+  "single failure after heal does NOT re-promote (oscillation damping)",
+  (await readJson(join(cycleDir, ".opencode", "dejavu", "gates.json"))).find((g) => g.key === cycleKey)?.status === "watching",
+)
+// A full fresh bar (3 failures since retirement) re-promotes and resets lifecycle.
+await failOn(hooksCY)(CYCLE_CMD, "cy8", "cy8")
+await failOn(hooksCY)(CYCLE_CMD, "cy9", "cy9")
+const cycleGate = (await readJson(join(cycleDir, ".opencode", "dejavu", "gates.json"))).find((g) => g.key === cycleKey)
+check(
+  "re-promotion resets lifecycle counters (taught check sees the new lifecycle)",
+  cycleGate?.status === "blocking" && cycleGate?.remindedCount === 0 && cycleGate?.recurredAfterGate === 0 && cycleGate?.overrideCount === 0,
+)
+
+// --- 74. first-encounter failures never saw a reminder and must not demote ---
+const firstDir = join(tmp, "first-encounter-project")
+const FIRST_CMD = "first encounter cmd"
+const firstKey = patternKey(callSignature("bash", { command: FIRST_CMD }) ?? "")
+await seedGates(firstDir, [seedGate({ key: firstKey, signature: `bash:${FIRST_CMD}` })])
+const hooksFE = await Dejavu({ directory: firstDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+await failOn(hooksFE)(FIRST_CMD, "fe-a", "fe-a")
+await failOn(hooksFE)(FIRST_CMD, "fe-b", "fe-b")
+await failOn(hooksFE)(FIRST_CMD, "fe-c", "fe-c")
+const firstGate = (await readJson(join(firstDir, ".opencode", "dejavu", "gates.json"))).find((g) => g.key === firstKey)
+check("first-encounter failures count as recurrences", firstGate?.recurredAfterGate === 3)
+check("first-encounter failures do not demote (the gate never spoke)", firstGate?.status === "blocking" && firstGate?.feedbackDemoted !== true)
+
+// --- 75. paren-wrapped chains must not blanket-grant exit-1 immunity ---
+check("paren-wrapped chain flattens for immunity (non-diagnostic failure not hidden)", !isIntendedNonzero("(deploy --broken && grep done log.txt)", 1))
+check("paren-wrapped all-diagnostic chain keeps immunity", isIntendedNonzero("(grep a f && grep b f)", 1))
+check("plain all-diagnostic chain keeps immunity", isIntendedNonzero("grep a f && grep b f", 1))
+
+// --- 76. re-promotion clears stale session chains (no skipped reminder) ---
+const rePromoDir = join(tmp, "repromo-project")
+const RE_PROMO_CMD = "repromo chain cmd"
+const rePromoKey = patternKey(callSignature("bash", { command: RE_PROMO_CMD }) ?? "")
+await seedGates(rePromoDir, [
+  seedGate({ key: rePromoKey, signature: `bash:${RE_PROMO_CMD}`, remindedSessions: { "rp-old": Date.now() }, failedSessions: { "rp-old": Date.now() } }),
+])
+const hooksRP = await Dejavu({ directory: rePromoDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+for (let i = 1; i <= 3; i++) {
+  await (hooksRP["tool.execute.after"] as AfterHook)(
+    { tool: "bash", sessionID: `rp-h${i}`, callID: `rp-h${i}`, args: { command: RE_PROMO_CMD } } as unknown as AfterInput,
+    { title: RE_PROMO_CMD, output: "ok", metadata: { exit: 0 } } as unknown as AfterOutput,
+  )
+}
+check("lifecycle heals before re-promotion test", (await readJson(join(rePromoDir, ".opencode", "dejavu", "gates.json"))).find((g) => g.key === rePromoKey)?.status === "watching")
+// Damping: one failure after heal must NOT re-promote.
+await failOn(hooksRP)(RE_PROMO_CMD, "rp-new", "rp-new")
+check(
+  "single failure after heal does NOT re-promote (chains test)",
+  (await readJson(join(rePromoDir, ".opencode", "dejavu", "gates.json"))).find((g) => g.key === rePromoKey)?.status === "watching",
+)
+// A full fresh bar re-promotes; the lifecycle reset clears the stale chains.
+await failOn(hooksRP)(RE_PROMO_CMD, "rp-new", "rp-n2")
+await failOn(hooksRP)(RE_PROMO_CMD, "rp-new", "rp-n3")
+const rePromoGate = (await readJson(join(rePromoDir, ".opencode", "dejavu", "gates.json"))).find((g) => g.key === rePromoKey)
+check("re-promotion clears stale session chains", rePromoGate?.status === "blocking" && rePromoGate?.remindedSessions === undefined && rePromoGate?.failedSessions === undefined)
+check("re-promoted gate reminds the new session (stale chain did not skip it)", (await attemptWith(hooksRP)(RE_PROMO_CMD, "rp-new", "rp-att"))?.message.includes("REMINDER") === true)
+
+// --- 77. suggestCorrection branch selection (the teaching content) ---
+check("suggestCorrection: --check artifacts branch", suggestCorrection("bash:dart run tools/gen.dart --check <n>", "stale").startsWith("Generated artifacts"))
+check("suggestCorrection: test-runner branch", suggestCorrection("bash:pytest tests/test_x.py", "FAILED").startsWith("A test is failing"))
+check("suggestCorrection: type-error branch", suggestCorrection("bash:npx tsc --noemit <n>", "error TS2322").startsWith("Type errors"))
+check("suggestCorrection: network branch", suggestCorrection("bash:curl https://api.example.com", "timeout").startsWith("Network/endpoint"))
+check("suggestCorrection: install branch", suggestCorrection("bash:npm install --legacy-peer-deps", "ERESOLVE").startsWith("Dependency install"))
+check("suggestCorrection: snippet fallback", suggestCorrection("bash:weird custom cmd", "ENOENT: no such file").includes("ENOENT"))
+check("suggestCorrection: generic fallback", suggestCorrection("bash:weird custom cmd", "exit code 1").startsWith("This exact call keeps failing"))
+
+// --- 78. migration stamp: second start of the same version skips the scan ---
+const stampDir = join(tmp, "stamp-project")
+const STAMP_CMD = "stamp probe cmd"
+await seedGates(stampDir, [seedGate({ key: patternKey(callSignature("bash", { command: STAMP_CMD }) ?? ""), signature: `bash:${STAMP_CMD}` })])
+await Dejavu({ directory: stampDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+const stampedFile = JSON.parse(await readFile(join(stampDir, ".opencode", "dejavu", "gates.json"), "utf8")) as { migrated?: string; gates: unknown[] }
+check("first init stamps the store with the plugin version", stampedFile.migrated === PLUGIN_VERSION)
+// Corrupt a gate in a way migrate would repair (policy violation), but with
+// the stamp present the scan is skipped — repairGate on load still heals it,
+// proving the stamp skips only the migrate scan, not safety.
+await Dejavu({ directory: stampDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+const restampedFile = JSON.parse(await readFile(join(stampDir, ".opencode", "dejavu", "gates.json"), "utf8")) as { migrated?: string; gates: unknown[] }
+check("second init keeps the stamp and the gates intact", restampedFile.migrated === PLUGIN_VERSION && restampedFile.gates.length === 1)
+
+// --- 79. stale-steal is pid-liveness-gated and reported ---
+const stealDir = join(tmp, "steal-project")
+await seedGates(stealDir, [seedGate({ key: "abababababab", signature: "bash:steal probe cmd" })])
+const stealLockPath = join(stealDir, ".opencode", "dejavu", "gates.json.lock")
+// Find a pid that is definitely dead (process.kill(pid, 0) throws ESRCH).
+let deadPid = "999999"
+for (const candidate of [999999, 999998, 999997, 888888, 777777]) {
+  try {
+    process.kill(candidate, 0)
+  } catch {
+    deadPid = String(candidate)
+    break
+  }
+}
+await writeFile(stealLockPath, deadPid, "utf8")
+const past = new Date(Date.now() - 60_000)
+await utimes(stealLockPath, past, past)
+const hooksST = await Dejavu({ directory: stealDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+await failOn(hooksST)("steal probe cmd", "st1", "st1")
+check("stale lock of a dead pid is stolen (init+failure proceed)", !existsSync(stealLockPath))
+check("stale-steal is logged", (await readFile(join(stealDir, ".opencode", "dejavu", "log.jsonl"), "utf8")).includes("stale lock stolen"))
+
+// --- 80. paren sub-expressions do NOT blanket-immunize the outer command ---
+check("diagnostic nested as sub-expression does not immunize outer verb", !isIntendedNonzero("deploy (grep x)", 1))
+check("paren-wrapped single diagnostic keeps immunity", isIntendedNonzero("(grep a f)", 1))
+check("nested diagnostic chain keeps immunity", isIntendedNonzero("(grep a f && grep b f)", 1))
+
+// --- 81. migration stamp survives reconcile (init-storm killer stays alive) ---
+const stampSurviveDir = join(tmp, "stamp-survive-project")
+const STAMP_SURVIVE_CMD = "stamp survive cmd"
+await seedGates(stampSurviveDir, [seedGate({ key: patternKey(callSignature("bash", { command: STAMP_SURVIVE_CMD }) ?? ""), signature: `bash:${STAMP_SURVIVE_CMD}` })])
+await Dejavu({ directory: stampSurviveDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+// Second init: reconcile runs BEFORE migrate and must preserve the stamp.
+await Dejavu({ directory: stampSurviveDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+const stampSurviveFile = JSON.parse(await readFile(join(stampSurviveDir, ".opencode", "dejavu", "gates.json"), "utf8")) as { migrated?: string }
+check("migration stamp survives reconcile across restarts", stampSurviveFile.migrated === PLUGIN_VERSION)
+
+// --- 82. flushDeferred persists queued repair events (scripts exit cleanly) ---
+const flushDir = join(tmp, "flush-project")
+const flushStore = new GateStore(flushDir)
+flushStore.deferEvent({ type: "repaired", key: "test", snippet: "flush probe" })
+await flushStore.flushDeferred()
+check("flushDeferred persists queued events", (await readFile(join(flushDir, "log.jsonl"), "utf8")).includes("flush probe"))
+// empty queue is a no-op
+await flushStore.flushDeferred()
+check("flushDeferred is idempotent on empty queue", true)
+
+// --- 83. logAll scoping: high-volume events stay in the project log, salient
+// events (promoted/demoted/healed/override/init) also reach the global log ---
+const scopeDir = join(tmp, "scoping-project")
+const SCOPE_CMD = "scoping probe cmd"
+const scopeKey = patternKey(callSignature("bash", { command: SCOPE_CMD }) ?? "")
+const hooksSC = await Dejavu({ directory: scopeDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+await failOn(hooksSC)(SCOPE_CMD, "sc1", "sc1")
+await failOn(hooksSC)(SCOPE_CMD, "sc1", "sc2")
+await failOn(hooksSC)(SCOPE_CMD, "sc2", "sc3") // promotes (3 failures x 2 sessions)
+const scopeProjLog = await readFile(join(scopeDir, ".opencode", "dejavu", "log.jsonl"), "utf8")
+const globalLogScoped = await readFile(join(tmp, "global", "log.jsonl"), "utf8")
+check("detected event lands in the project log", scopeProjLog.includes(`"type":"detected","key":"${scopeKey}"`))
+check("detected event is NOT duplicated to the global log (scoping)", !globalLogScoped.includes(`"type":"detected","key":"${scopeKey}"`))
+check("promoted (salient) event reaches the global log", globalLogScoped.includes(`"type":"promoted","key":"${scopeKey}"`))
+
+// --- 84. recordFailure flat lock phases: escalation still works (no deadlock,
+// global-first-then-remove-local preserved). The gate promotes in project A,
+// then project B's failure escalates it: B's (just-created) copy moves to
+// global and is removed from B; project A's copy stays until migrate dedupes. ---
+const escDirA = join(tmp, "flat-esc-a")
+const escDirB = join(tmp, "flat-esc-b")
+const hooksEA = await Dejavu({ directory: escDirA, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+const hooksEB = await Dejavu({ directory: escDirB, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+const FLAT_CMD = "flat escalation cmd"
+const flatSig = callSignature("bash", { command: FLAT_CMD }) ?? ""
+await failOn(hooksEA)(FLAT_CMD, "fe1", "fe1")
+await failOn(hooksEA)(FLAT_CMD, "fe1", "fe2")
+await failOn(hooksEA)(FLAT_CMD, "fe2", "fe3") // promotes in project A
+await failOn(hooksEB)(FLAT_CMD, "fe4", "fe4") // second project -> escalates
+const flatGlobalGates = await readJson(join(tmp, "global", "gates.json"))
+const flatProjBGates = await readJson(join(escDirB, ".opencode", "dejavu", "gates.json"))
+check("flat-phase escalation moves the gate to global", flatGlobalGates.some((g) => g.signature === flatSig))
+check("flat-phase escalation removes the escalating project's copy", !flatProjBGates.some((g) => g.signature === flatSig))
+
+// --- 85. cross-channel dedup: the same failure recorded by the after-hook
+// (exit/text) AND the event channel (error-state part) within the window is ONE
+// call double-firing — count it once. The channels are disjoint by construction
+// today, so this guard only ever trips if upstream starts emitting both. ---
+const dedupeDir = join(tmp, "dedupe-project")
+const DEDUPE_CMD = "dedupe cross channel cmd"
+const dedupeKey = patternKey(callSignature("bash", { command: DEDUPE_CMD }) ?? "")
+const hooksDD = await Dejavu({ directory: dedupeDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+// Channel 1: after-hook bash failure.
+await failOn(hooksDD)(DEDUPE_CMD, "dd1", "dd1")
+// Channel 2: the SAME call surfacing as an error-state tool part.
+await (hooksDD.event as EventHook)(
+  {
+    event: {
+      type: "message.part.updated",
+      properties: {
+        part: {
+          id: "dd-part-1",
+          type: "tool",
+          tool: "bash",
+          sessionID: "dd1",
+          state: { status: "error", error: "Error: kaboom", input: { command: DEDUPE_CMD } },
+        },
+      },
+    },
+  } as unknown as EventInput,
+)
+const dedupeGate = (await readJson(join(dedupeDir, ".opencode", "dejavu", "gates.json"))).find((g) => g.key === dedupeKey)
+check("cross-channel duplicate is counted once (dedup guard)", dedupeGate?.count === 1)
+
+// --- 85b. chain dedup symmetry: the after-hook attributes a chained failure to
+// the known segment gate, but the dedup must key on the WHOLE-CALL signature
+// (matching the event channel) or a double-firing chained call slips through. ---
+const chainDedupeDir = join(tmp, "chain-dedupe-project")
+const CHAIN_SEG_CMD = "gated seg cmd"
+const CHAIN_SEG_SIG = callSignature("bash", { command: CHAIN_SEG_CMD }) ?? ""
+const CHAIN_FULL_CMD = "echo x && gated seg cmd"
+const CHAIN_FULL_SIG = callSignature("bash", { command: CHAIN_FULL_CMD }) ?? ""
+await seedGates(chainDedupeDir, [
+  seedGate({
+    key: patternKey(CHAIN_SEG_SIG),
+    signature: CHAIN_SEG_SIG,
+    status: "watching",
+    count: 1,
+    sessions: ["c0"],
+    firstSeen: new Date().toISOString(),
+    lastSeen: new Date().toISOString(),
+  }),
+])
+const hooksCD = await Dejavu({ directory: chainDedupeDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+// Channel 1: after-hook — the chain attributes to the known segment gate.
+await failOn(hooksCD)(CHAIN_FULL_CMD, "cd1", "cd1")
+// Channel 2: the SAME chained call surfacing as an error-state part (whole-call signature).
+await (hooksCD.event as EventHook)(
+  {
+    event: {
+      type: "message.part.updated",
+      properties: {
+        part: {
+          id: "cd-part-1",
+          type: "tool",
+          tool: "bash",
+          sessionID: "cd1",
+          state: { status: "error", error: "Error: kaboom", input: { command: CHAIN_FULL_CMD } },
+        },
+      },
+    },
+  } as unknown as EventInput,
+)
+const chainDedupeGates = await readJson(join(chainDedupeDir, ".opencode", "dejavu", "gates.json"))
+check("chained double-fire is deduped on the whole-call key", !chainDedupeGates.some((g) => g.key === patternKey(CHAIN_FULL_SIG)))
+check("chained failure still attributed to the segment gate once", chainDedupeGates.find((g) => g.key === patternKey(CHAIN_SEG_SIG))?.count === 2)
+
+// --- 86. round-8 invariant: a corrupt GLOBAL gates.json is quarantined under the
+// gates lock by reconcile(); the unlocked routing peeks in reconcileAll (escalation
+// filter + index rebuild) are non-force and never write. After init the store is
+// fresh and the corrupt bytes are kept. (Runs last: it corrupts the shared global
+// store, so nothing after it may depend on global gates.) ---
+const r8ProjDir = join(tmp, "round8-project")
+const r8GlobalDir = join(tmp, "global")
+await mkdir(r8GlobalDir, { recursive: true })
+await writeFile(join(r8GlobalDir, "gates.json"), "{ corrupted global gates", "utf8")
+await Dejavu({ directory: r8ProjDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+const r8Quarantine = (await readdir(r8GlobalDir)).filter((f) => f.startsWith("gates.json.corrupt-"))
+check("corrupt global gates.json is quarantined by under-lock reconcile", r8Quarantine.length >= 1)
+check("corrupt global bytes are preserved", (await readFile(join(r8GlobalDir, r8Quarantine[0] ?? ""), "utf8")).includes("corrupted global gates"))
+check("global store restarts fresh after quarantine", (await readJson(join(r8GlobalDir, "gates.json"))).length === 0)
 
 await rm(tmp, { recursive: true, force: true })
 

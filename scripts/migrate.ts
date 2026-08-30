@@ -1,7 +1,13 @@
 /**
  * One-off migration runner for existing dejavu stores.
- * Demotes probe-tool blocking gates to watching and secret-scrubs all
- * signatures/snippets. Idempotent; also runs automatically at plugin init.
+ * Re-tiers gates learned under older policies (probe-tool blocking → watching,
+ * diagnostics → reminding), backfills mechanical corrections, sanitizes
+ * signatures/snippets/corrections (secrets + terminal control chars), applies
+ * feedback-demotion catch-up, and merges stale project copies of global gates.
+ * Idempotent; also runs automatically at plugin init.
+ *
+ * WARNING: the log-scrub step below rewrites log.jsonl WITHOUT the log lock —
+ * run this while OpenCode is closed, or appends racing the rewrite are lost.
  *
  * Usage: bun scripts/migrate.ts <projectDir> [moreProjectDirs...]
  */
@@ -16,8 +22,13 @@ const projects = process.argv.slice(2)
 const targets = projects.length > 0 ? projects : [process.cwd()]
 
 for (const project of targets) {
-  const stores = new Stores(globalStore, new GateStore(join(project, ".opencode", "dejavu")))
+  const projectStore = new GateStore(join(project, ".opencode", "dejavu"))
+  const stores = new Stores(globalStore, projectStore)
   await stores.migrate()
+  // The script exits after this — flush deferred demotion events now, or they
+  // are silently lost ("every repair is logged" invariant).
+  await globalStore.flushDeferred()
+  await projectStore.flushDeferred()
   console.log(`migrated: ${project}`)
 }
 

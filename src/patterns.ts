@@ -47,6 +47,26 @@ export function scrubSecrets(text: string): string {
   return s
 }
 
+/**
+ * Terminal control characters (PowerShell VT-colored errors, bells, NULs)
+ * carry no signal — persisted they corrupt snippets/corrections with raw
+ * escape sequences (`ESC[31;1m...`) and fragmented identities when the
+ * coloring varies between runs. ANSI sequences first (they end in a letter,
+ * which bare C0 stripping would strand), then all C0 except LF/CR/TAB —
+ * those three carry structure (multi-line commands, indentation).
+ */
+export function stripControl(text: string): string {
+  return text
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "")
+    .replace(/\u001b./g, "")
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
+}
+
+/** The persistence boundary: control-char strip + secret scrub, in one call. */
+export function sanitizeForStore(text: string): string {
+  return scrubSecrets(stripControl(text))
+}
+
 // --- Normalization -----------------------------------------------------------
 
 /**
@@ -56,12 +76,28 @@ export function scrubSecrets(text: string): string {
  * payload instead: same code = same key, different code = different key.
  * Secrets are scrubbed before hashing so they neither persist nor fragment.
  */
+/**
+ * PowerShell shapes included: call operator + QUOTED exe path
+ * (`& "C:\...\python.exe" -c ...`) and bare interpreter alike. The quoted
+ * path needs the quote in the prefix class and an optional closing quote,
+ * otherwise `-c` never lines up and the payload escapes fingerprinting.
+ * Leading env assignments (`PYTHONPATH=x python -c ...`) are allowed in the
+ * anchor and stay in the prefix — without them the one-liner escaped
+ * fingerprinting entirely. Flag alternatives run LONGEST FIRST: regex
+ * alternatives are ordered, and `-c` matching inside `-command` swallowed
+ * `ommand` into the payload — fragmenting keys across spellings of the same
+ * call. `py` is the Windows Python launcher (`py -3 -c ...`).
+ */
 const INTERPRETER_ONELINER =
-  /(?:^|[|;&(\n]\s*)(?:\S+[\\/])?(python3?|node|bun|deno|perl|ruby|pwsh|powershell)(?:\.exe)?(?:\s+-\w+)*\s+(-c|-e|--eval|-command)\s*/i
+  /(?:^|[|;&(\n]\s*)(?:\w+=\S+\s+)*(?:["']?\S*[\\/])?(python3?|py|node|bun|deno|perl|ruby|pwsh|powershell)(?:\.exe)?["']?(?:\s+-\w+)*\s+(-command|-encodedcommand|--eval|-c|-e)\s*/i
 
 function hashInterpreterPayload(command: string): string {
   const match = INTERPRETER_ONELINER.exec(command)
   if (!match) return command
+  // PowerShell here-string payloads (`@"..."@` / `@'...'@`) — the wrapper
+  // markers are part of the payload and hash with it. Previously the `@`
+  // markers survived normalization and the quoted body collapsed to <str>,
+  // leaving raw code tokens leaking into signatures when quotes unbalanced.
   const payload = command.slice(match.index + match[0].length)
   if (payload.trim() === "") return command
   // Already fingerprinted (re-normalization) — keep the existing token so
@@ -75,7 +111,40 @@ function hashInterpreterPayload(command: string): string {
   // Trim before hashing: trailing whitespace (e.g. a stripped override marker)
   // is not part of the code's identity.
   const fingerprint = createHash("sha1").update(scrubSecrets(payload.trim())).digest("hex").slice(0, 8)
-  return `${command.slice(0, match.index + match[0].length)}<code:${fingerprint}>`
+  // Long PowerShell flags converge to -c: `-command`/`-encodedcommand` are
+  // spellings of the same one-liner call — one identity, not three families.
+  const prefix = command.slice(0, match.index + match[0].length).replace(/-(?:command|encodedcommand)(\s*)$/i, "-c$1")
+  return `${prefix}<code:${fingerprint}>`
+}
+
+/**
+ * Windows wrapper verb: `cmd /c "real command"` — the payload IS the call.
+ * Unwrapped, the payload normalizes with its own identity and its real verb
+ * stays visible to the diagnostic policy; left wrapped, `/c` becomes `<path>`
+ * and the payload becomes `<str>`, so `cmd <path> <str>` matched every cmd
+ * invocation on the machine. Recursion terminates: the payload is strictly
+ * shorter than the wrapper command.
+ */
+const CMD_WRAPPER = /^cmd(?:\.exe)?\s+(?:\/s\s+)?\/(c|k)\s+/i
+
+/**
+ * Raw payload of a `cmd /c|/k` wrapper, one wrapper-quote layer removed —
+ * null when the command is not wrapped. Shared by normalization (unwrap),
+ * segment expansion (inner chains) and override-marker visibility.
+ */
+export function cmdWrapperPayload(command: string): string | null {
+  const match = CMD_WRAPPER.exec(command)
+  if (!match) return null
+  let payload = command.slice(match[0].length).trim()
+  if ((payload.startsWith('"') && payload.endsWith('"') && payload.length >= 2) || (payload.startsWith("'") && payload.endsWith("'") && payload.length >= 2)) {
+    payload = payload.slice(1, -1).trim()
+  }
+  return payload === "" ? null : payload
+}
+
+function unwrapCmdWrapper(command: string): string {
+  const payload = cmdWrapperPayload(command)
+  return payload === null ? command : normalizeCommand(payload)
 }
 
 /**
@@ -84,10 +153,14 @@ function hashInterpreterPayload(command: string): string {
  * away so that "same failure, different instance" collapses into one pattern.
  */
 export function normalizeCommand(command: string): string {
+  // Terminal control characters (PowerShell VT colors) carry no identity and
+  // fragmented signatures when coloring varied between runs — strip first.
+  let s = stripControl(command)
   // CRLF/CR commands (Windows pastes, agent multi-line) normalize to LF —
   // otherwise the same command fragments across line-ending styles.
-  let s = command.replace(/\r\n?/g, "\n")
+  s = s.replace(/\r\n?/g, "\n")
   s = s.replace(COMMENT_LINE, "$1").toLowerCase()
+  s = unwrapCmdWrapper(s)
   s = hashInterpreterPayload(s)
   // Quoted spans come out FIRST: they are data, and removing them before the
   // path rules keeps normalization idempotent — a <str> replacement inserts
@@ -124,7 +197,7 @@ const PARAM_RULES: [RegExp, string][] = [
 ]
 
 export function parameterizeError(text: string): string {
-  let s = text.toLowerCase()
+  let s = stripControl(text).toLowerCase()
   for (const [rule, token] of PARAM_RULES) {
     s = s.replace(rule, token)
   }
@@ -147,9 +220,18 @@ const DIAGNOSTIC_VERBS: RegExp[] = [
   /\bplaywright test\b/i,
   /\bflutter (test|analyze)\b/i,
   /\bdart (analyze|format|fix)\b/i,
+  // Iteration runners: `dart run <script>`, `go run|build`, `cargo run|build`
+  // fail repeatedly WHILE the agent fixes the code — the failures are the
+  // work itself. Blocking them produced arms races (dozens of overrides in
+  // production data); they remind but never block, and their exit 1 is the
+  // intended "still broken" outcome of iteration.
+  /\bdart run\b/i,
+  /\bgo (run|build|test|vet)\b/i,
+  /\bcargo (run|build|test|clippy)\b/i,
   /\bgradlew\b[^\n;|&]*(test|compilejava|compiletestjava)/i,
   /\b(eslint|prettier --check)\b/i,
   /\btsc\b/i,
+  /\bmypy\b/i,
   /\bcurl\b/i,
   /\bls\b/i,
 ]
@@ -162,40 +244,135 @@ export function isDiagnosticSignature(signature: string): boolean {
   return isDiagnosticText(signature)
 }
 
-/** OpenCode normalizes non-zero exits to 1 in metadata, so discriminate by command shape. */
+/**
+ * OpenCode normalizes non-zero exits to 1 in metadata, so discriminate by
+ * command shape. Exit-1 immunity requires EVERY chain segment to be
+ * diagnostic: in `deploy --broken && grep done log.txt` the exit is deploy's
+ * failure — granting immunity because grep appears later would hide it.
+ * Paren groups are flattened to segment separators (`;`), NOT spaces:
+ * splitChain keeps `(deploy && grep)` as ONE segment, and flattening to
+ * spaces would merge `deploy (grep x)` into one segment where a diagnostic
+ * anywhere blanket-immunizes the non-diagnostic verb. Splitting at parens
+ * keeps command-level granularity (a diagnostic nested as a sub-expression
+ * argument does not immunize the outer command).
+ */
 export function isIntendedNonzero(command: string, exitCode: number): boolean {
-  return exitCode === 1 && isDiagnosticText(command)
+  if (exitCode !== 1) return false
+  const segments = splitChain(command.replace(/[()]/g, ";"))
+  return segments.length > 0 && segments.every((segment) => isDiagnosticText(segment))
+}
+
+// --- Residual identity (over-generic shape guard) ----------------------------
+
+/** Placeholder tokens carry no identity — except `<code:...>`: the
+ * fingerprint IS the identity of a one-liner payload. */
+const PLACEHOLDER_TOKEN = /^<(?:str|path|n|hash|uuid|sha|md5|ip|url|email|date)>$/
+
+/** Shell plumbing: redirections and here-string/call-operator debris. */
+const OPERATOR_TOKENS = new Set(["&", "@", ">", "<", ">&", ">>", "2>&1", "2>"])
+
+/** Tokens that pass code/module to an interpreter — structure, not identity.
+ * `-m`/`--module` included: the NEXT token is the program, exactly like -c —
+ * `python -m <str>` (quoted module) must not gain identity from the flag. */
+const CODE_PASSING_FLAGS = new Set(["-c", "-e", "--eval", "-command", "-encodedcommand", "-m", "--module"])
+
+/** Shell builtins that only position the session: a chain headed by one
+ * (`cd <path> && python <path>`) must not borrow identity from the builtin —
+ * the whole chain may be parameterized away. */
+const NO_IDENTITY_HEADS = new Set(["cd", "pushd", "popd", "set-location", "exit"])
+
+/** Pipe-stage cmdlets that only post-process output: a segment made of
+ * plumbing (`... | select-object -last <n>`) contributes no identity. */
+const PLUMBING_HEADS = new Set([
+  "select-object",
+  "select-string",
+  "out-string",
+  "out-file",
+  "out-null",
+  "foreach-object",
+  "where-object",
+  "sort-object",
+  "measure-object",
+  "tee-object",
+  "write-host",
+  "write-output",
+  "more",
+])
+
+/** Wrappers whose bare name is not a call identity: their ARGUMENTS are the
+ * call. If the arguments were all parameterized away, the signature matches
+ * an entire command family — enforcing it would punish unrelated calls. */
+const WRAPPER_BASENAMES = new Set(["cmd", "py", "node", "python", "python3", "bun", "deno", "perl", "ruby", "pwsh", "powershell"])
+
+function baseName(token: string): string {
+  const bare = token.replace(/^["']+|["']+$/g, "")
+  const parts = bare.split(/[\\/]/)
+  const last = parts[parts.length - 1] ?? bare
+  return last.toLowerCase().replace(/\.exe$/, "")
+}
+
+function segmentHasIdentity(segment: string): boolean {
+  const tokens = segment.split(/\s+/).filter((t) => t !== "")
+  let head = ""
+  let headIdx = -1
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i] ?? ""
+    if (PLACEHOLDER_TOKEN.test(token) || OPERATOR_TOKENS.has(token) || CODE_PASSING_FLAGS.has(token)) continue
+    head = token
+    headIdx = i
+    break
+  }
+  if (head === "") return false
+  if (head.startsWith("<code:")) return true
+  if (PLUMBING_HEADS.has(head)) return false
+  if (NO_IDENTITY_HEADS.has(head)) return false
+  if (!WRAPPER_BASENAMES.has(baseName(head))) return true
+  // Wrapper/interpreter head: identity must come from a surviving argument
+  // (a literal path/script, or a <code:...> fingerprint).
+  for (let i = headIdx + 1; i < tokens.length; i++) {
+    const token = tokens[i] ?? ""
+    if (token.startsWith("<code:")) return true
+    if (PLACEHOLDER_TOKEN.test(token) || CODE_PASSING_FLAGS.has(token) || OPERATOR_TOKENS.has(token)) continue
+    return true
+  }
+  return false
 }
 
 /**
- * A code flag whose payload was entirely parameterized away (`-c <str>`)
- * carries no identity — blocking that shape blocks the whole command family.
- * New one-liners get <code:...> fingerprints in normalizeCommand; this guard
- * keeps legacy pre-fingerprint gates (and lookalikes) from ever blocking.
+ * A signature keeps residual identity when at least one chain segment names
+ * a concrete call. Signatures whose substance was entirely parameterized —
+ * `cmd <path> <str>`, `node <str> <n> >& <n>`, `& <str> -c @ <str> @`,
+ * chains starting with an unknown `<str>` head — match whole command
+ * families: they may be measured (watching) but never enforced. This
+ * generalizes the legacy bare-one-liner guard: ANY future normalization gap
+ * degrades to watching instead of blocking arbitrary calls.
  */
-const GENERIC_ONELINER_SHAPE = /(^|\s)(-c|-e|--eval|-command)\s+(?:@\s+)?<str>(?:\s+@)?\s*$/i
+export function hasResidualIdentity(signature: string): boolean {
+  const body = signature.startsWith("bash:") ? signature.slice("bash:".length) : signature
+  return body.split(/\s*(?:\|\||&&|[|;&])\s*|\n+/).some((segment) => segmentHasIdentity(segment))
+}
 
 /**
  * Blocking policy: only bash commands that are NOT diagnostics may ever
  * become enforced gates. File probes and diagnostic queries are measured
  * (watching) but never interrupt the agent — the data showed blocking them
- * punishes normal work.
+ * punishes normal work. Signatures without residual identity never enforce
+ * at any tier — they are too broad to interrupt anything.
  */
 export function canBlock(tool: string, signature: string): boolean {
   if (tool !== "bash") return false
-  if (isDiagnosticSignature(signature)) return false
-  return !GENERIC_ONELINER_SHAPE.test(signature)
+  if (!hasResidualIdentity(signature)) return false
+  return !isDiagnosticSignature(signature)
 }
 
 /**
  * Remind-only policy: diagnostic bash commands still surface a REMINDER when
  * they recur (the old behavior gave them zero signal), but they NEVER block —
  * blocking a test/lint the agent is iterating on punishes normal work.
- * Generic one-liner shapes stay unenforced: they are too broad to remind on.
  */
 export function canRemind(tool: string, signature: string): boolean {
   if (tool !== "bash") return false
-  if (GENERIC_ONELINER_SHAPE.test(signature)) return false
+  if (!hasResidualIdentity(signature)) return false
   return isDiagnosticSignature(signature)
 }
 
@@ -288,10 +465,28 @@ export function splitChain(command: string): string[] {
   return segments
 }
 
-/** Per-segment signatures for a bash command (bypass protection for chains). */
+/**
+ * Per-segment signatures for a bash command (bypass protection for chains).
+ * cmd wrappers expand recursively: quote-aware splitChain keeps
+ * `cmd /c "a && gated"` as ONE segment, so the inner chain must unfold here —
+ * a gate on the inner command must fire through the wrapper. Depth-bounded:
+ * nested wrappers are pathological.
+ */
 export function bashSegmentSignatures(command: string): string[] {
   const clean = command.replace(OVERRIDE_MARKER, "")
-  return splitChain(clean).map((segment) => `bash:${normalizeCommand(segment)}`)
+  const signatures: string[] = []
+  const expand = (text: string, depth: number): void => {
+    for (const segment of splitChain(text)) {
+      const payload = depth < 3 ? cmdWrapperPayload(segment) : null
+      if (payload === null) {
+        signatures.push(`bash:${normalizeCommand(segment)}`)
+      } else {
+        expand(payload, depth + 1)
+      }
+    }
+  }
+  expand(clean, 0)
+  return signatures
 }
 
 /** Normalize a file path: keep basename + extension, drop directories. */
@@ -373,12 +568,25 @@ const CODE_FINGERPRINTS = /<code:[0-9a-f]+>/g
  * DISJOINT flag sets are different operations and must never fuzzy-merge
  * ("train --lr <n>" vs "train --epochs <n>"). A subset IS allowed — extra
  * switches on the same operation ("gradlew test --no-daemon") still belong to
- * the same gate, otherwise enforcement fragments across harmless variants. */
+ * the same gate, otherwise enforcement fragments across harmless variants.
+ * Cached: the flood path calls fuzzySimilar per gate under the gates lock and
+ * would otherwise re-split/sort the SAME incoming signature on every pair. */
+const FLAG_TOKEN_CACHE_CAP = 512
+const flagTokenCache = new Map<string, string[]>()
 function flagTokens(signature: string): string[] {
-  return signature
+  const cached = flagTokenCache.get(signature)
+  if (cached !== undefined) return cached
+  const tokens = signature
     .split(/\s+/)
     .filter((token) => token.startsWith("-"))
     .sort()
+  if (flagTokenCache.size >= FLAG_TOKEN_CACHE_CAP) {
+    // Evict an arbitrary (oldest-inserted) entry to bound memory.
+    const oldest = flagTokenCache.keys().next().value
+    if (oldest !== undefined) flagTokenCache.delete(oldest)
+  }
+  flagTokenCache.set(signature, tokens)
+  return tokens
 }
 
 function flagSubset(a: string[], b: string[]): boolean {
@@ -404,6 +612,16 @@ export const FUZZY_MAX_LEN = 300
  */
 export function fuzzySimilar(a: string, b: string): boolean {
   if (a === b) return true
+  // Cheapest rejects FIRST: the length band is O(1) with zero allocation and
+  // zero false negatives — it must run before any regex/flag work, because
+  // the flood path calls this per gate under the gates lock.
+  const maxLen = Math.max(a.length, b.length)
+  if (maxLen === 0) return true
+  if (maxLen > FUZZY_MAX_LEN) return false
+  // Triangle inequality: distance >= |lenA - lenB|. If even that floor
+  // exceeds the ratio threshold, no Levenshtein result can pass — an O(1)
+  // pre-filter with zero false negatives that skips most DP computations.
+  if (Math.abs(a.length - b.length) / maxLen > 0.3) return false
   const codesA = a.match(CODE_FINGERPRINTS)
   const codesB = b.match(CODE_FINGERPRINTS)
   if (codesA !== null || codesB !== null) {
@@ -412,13 +630,6 @@ export function fuzzySimilar(a: string, b: string): boolean {
   const flagsA = flagTokens(a)
   const flagsB = flagTokens(b)
   if (!flagSubset(flagsA, flagsB) && !flagSubset(flagsB, flagsA)) return false
-  const maxLen = Math.max(a.length, b.length)
-  if (maxLen === 0) return true
-  if (maxLen > FUZZY_MAX_LEN) return false
-  // Triangle inequality: distance >= |lenA - lenB|. If even that floor
-  // exceeds the ratio threshold, no Levenshtein result can pass — an O(1)
-  // pre-filter with zero false negatives that skips most DP computations.
-  if (Math.abs(a.length - b.length) / maxLen > 0.3) return false
   const distance = levenshtein(a, b)
   return distance >= 3 && distance / maxLen <= 0.3
 }
@@ -450,7 +661,9 @@ const FAILURE_SIGNATURES: RegExp[] = [
 ]
 
 export function detectFailure(outputText: string): FailureDetection {
-  for (const line of outputText.split("\n")) {
+  // PowerShell colors errors with VT sequences — strip before scanning, or
+  // the escapes persist into snippets/corrections shown to the agent.
+  for (const line of stripControl(outputText).split("\n")) {
     for (const signature of FAILURE_SIGNATURES) {
       if (signature.test(line)) {
         return { matched: true, snippet: line.trim().slice(0, 200) }
@@ -467,7 +680,7 @@ export function detectFailure(outputText: string): FailureDetection {
  * line — compilers/test runners print their summary at the end.
  */
 export function failureSnippet(outputText: string, exitCode: number | null): string {
-  const lines = outputText
+  const lines = stripControl(outputText)
     .split("\n")
     .map((l) => l.trim())
     .filter((l) => l !== "")
@@ -489,6 +702,8 @@ const NOISE_ERRORS: RegExp[] = [
   /\baborted by user\b/i,
   /\bcancelled by user\b/i,
   /\bcanceled by user\b/i,
+  /no results found for your query/i, // grep_app empty search: the tool worked, nothing matched
+  /user dismissed this question/i, // question tool: the user's choice, not a failure
 ]
 
 export function isNoiseError(errorText: string): boolean {
