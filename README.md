@@ -29,9 +29,9 @@ Design decisions (post-mortem of existing approaches):
 - **Gate messages are teachers.** Every message carries `CORRECTION:` (what to do instead) and `EVIDENCE:` (N failures across M sessions), not just a prohibition.
 - **Mechanical pattern-keys only.** No LLM-based error classification in the hot path — the unreliable component doesn't do reliability work.
 - **Two scopes.** Repo-specific gotchas live in `<repo>/.opencode/dejavu/` (committable); patterns seen in 2+ project dirs are agent-level habits and move to `~/.config/opencode/dejavu/`. No single store can see all projects, so a global pattern index (`index.json`) counts distinct project dirs per key and drives the escalation.
-- **Gates rot — so they expire.** 60 days without recurrence and a gate is dropped. A gate firing 10+ times while the error stopped gets `review: true` for manual inspection.
+- **Gates rot — so they expire.** 60 days without recurrence and a gate is dropped. A gate blocked 10+ times without the error going away gets `review: true` for manual inspection.
 - **The metric is recurrence-after-gate.** Tracked per gate as `recurredAfterGate` — if gates don't reduce recurrence, the whole approach is wrong and you'll see it in the data.
-- **Enforcement has negative feedback.** The metric acts: a gate that keeps failing after promotion (3+ recurrences) or keeps getting explicitly bypassed (5+ `dejavu:proceed` overrides) is friction, not teaching — it demotes itself to `watching` and never re-promotes mechanically (`feedbackDemoted`). A human can re-enforce by editing `gates.json`; the gate then gets a fresh grace window.
+- **Enforcement has negative feedback.** The metric acts: a gate that keeps failing after promotion (3+ recurrences across 2+ sessions that reoffended after a reminder) or keeps getting explicitly bypassed (5+ `dejavu:proceed` overrides on a blocking gate — reminding-gate overrides are logged but not counted) is friction, not teaching — it demotes itself to `watching` and never re-promotes mechanically (`feedbackDemoted`). A human can re-enforce by setting `status` back and clearing `feedbackDemoted` in `gates.json`; the gate then gets a fresh grace window.
 - **No identity, no teeth.** A signature whose substance was entirely parameterized away (`cmd <path> <str>`, `node <str>`) matches a whole command family and can never enforce — it may only watch. Over-generic shapes degrade to evidence instead of punishing unrelated calls.
 
 ## Install
@@ -62,8 +62,8 @@ Restart OpenCode. Gates appear automatically as failures recur — nothing to co
 
 ## Robustness & safety
 
-- **Blocking policy** — only `bash` commands that are NOT diagnostics may ever become blocking gates. File probes (read/edit/write/glob/grep) and diagnostics (tsc/eslint/mypy/pytest/gradle-test/flutter/curl/grep...) stay `watching` forever: measured, visible in reports, but never interrupting the agent. `canBlock()` in `src/patterns.ts` is the single source of truth. Signatures without residual identity (see above) enforce at no tier.
-- **One-liner identity** — for `python -c` / `node -e` / `bun -e` and friends the code payload IS the call, so it is fingerprinted (`<code:hash>`) instead of flattened to `<str>`: different scripts never share a gate, the same script failing repeatedly still converges. PowerShell shapes are covered — quoted exe paths (`& "C:\...\python.exe" -c ...`) and here-string payloads. Legacy bare `-c <str>` shapes can never block.
+- **Blocking policy** — only `bash` commands that are NOT diagnostics may ever become blocking gates. Diagnostics and iteration commands (tsc/eslint/mypy/pytest/gradle-test/flutter/curl/grep, `dart run`, `go run|build|test|vet`, `cargo run|build|test|clippy`...) promote to `reminding` — they signal but never block, so iterating on tests/builds is never punished. File probes (read/edit/write/glob/grep) stay `watching`: measured, visible in reports, never interrupting. `canBlock()`/`canRemind()` in `src/patterns.ts` are the single source of truth. Signatures without residual identity (see above) enforce at no tier.
+- **One-liner identity** — for `python -c` / `node -e` / `bun -e` and friends the code payload IS the call, so it is fingerprinted (`<code:hash>`) instead of flattened to `<str>`: different scripts never share a gate, the same script failing repeatedly still converges. PowerShell shapes are covered — quoted exe paths (`& "C:\...\python.exe" -c ...`), here-string payloads, env-prefixed invocations (`PYTHONPATH=x python -c ...`). Legacy bare `-c <str>` shapes never enforce at any tier (residual-identity guard).
 - **Wrapper unwrapping** — `cmd /c|/k "..."` normalizes to the INNER command: the gate key, identity and diagnostic tier all see the real call instead of a `cmd <path> <str>` shape matching every cmd invocation.
 - **Clean persistence** — terminal control characters (PowerShell VT colors, NULs) are stripped before anything touches disk; signatures, snippets and corrections never carry ANSI escapes.
 - **Secret scrubbing** — every signature and snippet passes `scrubSecrets()` (OpenAI/Anthropic/AWS/GitHub/Slack/Stripe/JWT/bearer/DB-conn-string/PEM patterns + `root@host`) before touching disk. Historical data is cleaned by `migrate()` at init or via `bun scripts/migrate.ts <dirs...>` (also scrubs logs).
@@ -73,10 +73,10 @@ Restart OpenCode. Gates appear automatically as failures recur — nothing to co
 - **Concurrency** — gates.json mutations run under an exclusive lockfile; log appends and rotation take their own lock (every OpenCode window shares the global log); writes are tmp+rename with EPERM/EACCES/EBUSY retry (Windows AV/indexer). NT long paths get the `\\?\` prefix. If a lock cannot be acquired within 3s the critical section degrades to unlocked (the tool pipeline must never hang) and emits a `degraded` log event — the only window where updates can be lost is visible.
 - **Multi-window safe** — the remind→block escalation chain is persisted on the gate itself (`remindedSessions`/`failedSessions`), not in process memory: several OpenCode windows on one store — and process restarts — all see the same chain. Enforcement always reads fresh gate state under the store lock.
 - **Near-duplicate consolidation** — new failures merge into existing patterns via normalized Levenshtein ≤ 0.3 with an absolute floor of 3 edits (replaces token Jaccard, which collapsed all `<str>` placeholders; the floor stops `git push` vs `git pull`-style merges).
-- **Bounded memory** — per-session maps are capped (200 sessions) and freed on `session.deleted`; handled part IDs evict FIFO; TTL expiry re-runs every 6 h in long-lived processes.
-- **Migration** — gates outside the blocking policy are demoted to `watching` automatically; project copies of already-global gates are merged into the global gate (evidence is consolidated, never deleted).
+- **Bounded memory** — per-session maps are capped (50 entries per gate) and freed on `session.deleted`; handled part IDs evict FIFO; TTL expiry and log rotation re-run every 6 h in long-lived processes.
+- **Migration** — gates outside the blocking policy are re-tiered automatically (diagnostics land in `reminding`, everything else in `watching`); already-proven recurring diagnostics start reminding immediately; project copies of already-global gates are merged into the global gate (evidence is consolidated, never deleted).
 - **Self-healing** — every init reconciles the stores: an unparseable `gates.json` is quarantined (bytes preserved as `gates.json.corrupt-<ts>`), gate records are strictly parsed and mechanically repaired (inverted dates swapped, duplicate keys merged, secrets/control-chars re-sanitized, stale blocking demoted), unparseable log lines are excised to `log.jsonl.corrupt`, and the cross-project index is reconciled (missing entries rebuilt; entries are never pruned on a single project's initiative — one process cannot see other projects' gates, and rot is bounded by the TTL sweep). Every repair is logged as a `repaired`/`quarantined` event.
-- **Gates heal, not just accumulate** — dejavu sees successes too: a SUCCESS matching an enforced gate grows `succeededAfterGate`, and after 3 in a row the gate retires to `watching` (logged `healed`), so a command you fixed stops triggering reminders. A failure resets the streak. This kills the "ruff check passed 10 times but dejavu still reminds" false positive. The negative twin: a gate the agent keeps fighting (recurrences or explicit overrides) demotes itself (logged `demoted`) — enforcement listens to behavior in both directions.
+- **Gates heal, not just accumulate** — dejavu sees successes too: a SUCCESS matching an enforced gate grows `succeededAfterGate`, and after 3 in a row the gate retires to `watching` (logged `healed`), so a command you fixed stops triggering reminders. A failure resets the streak. This kills the "ruff check passed 10 times but dejavu still reminds" false positive. The negative twin: a gate the agent keeps fighting (recurrences or explicit overrides) demotes itself (logged `demoted`) — enforcement listens to behavior in both directions. Third path: a gate reminded 5+ times with zero reoffense has TAUGHT its lesson (the agent changes behavior, so no success ever heals it) — it retires softly (logged `retired-taught`), re-promotion on new failures stays possible.
 - **Auto-corrections, no manual work** — a promoted gate always ships with a mechanical, overridable default correction chosen by command family (stale `--check` artifacts, failing tests, type errors, network, installs) or from the captured error line, so a gate never sits "NOT TEACHING" awaiting a human. `migrate()` backfills existing gates. Snippets now keep the last output line (`failureSnippet`) instead of a bare "exit code N".
 
 ## Observability (debugging aids)
@@ -105,20 +105,20 @@ Not covered (by design, v1): semantically-equivalent-but-syntactically-different
 | `~/.config/opencode/dejavu/gates.json` | global gates (agent habits) |
 | `~/.config/opencode/dejavu/index.json` | cross-project pattern index: which project dirs each failure key was seen in (escalation evidence) |
 | `<repo>/.opencode/dejavu/gates.json` | project gates (repo gotchas) |
-| `*/dejavu/log.jsonl` | every event: detected, promoted, reminded, blocked, override, expired, recurred-after-gate, demoted, healed, retired-healed, repaired, quarantined, degraded |
+| `*/dejavu/log.jsonl` | every event: detected, promoted, reminded, retry-allowed, blocked, override, expired, recurred-after-gate, demoted, healed, retired-healed, retired-taught, repaired, quarantined, degraded, init |
 | `*/dejavu/*.corrupt*` | quarantined corruption (unparseable gates.json, excised log lines) — bytes preserved for forensics; safe to delete after inspection |
 
-Both are human-editable. Removing a gate object disables it. Editing `correction` improves what the agent is told.
+Both are human-editable. Removing a gate object disables it. Editing `correction` improves what the agent is told. Clearing `feedbackDemoted` (and setting `status` back to `blocking`/`reminding`) re-enforces a gate the agent's behavior retired — it gets a fresh grace window via `feedbackBaseline`.
 
 ## Development
 
 ```bash
 bun install
-bun run typecheck        # tsc --noEmit (index.ts + src/**)
+bun run typecheck        # tsc --noEmit (index.ts, src/**, scripts/**, test/**)
 bun test/smoke.ts        # behavioral smoke test, no framework needed
 ```
 
-Tunables are named constants at the top of `index.ts` and `src/store.ts`: `PROMOTE_COUNT` (3), `PROMOTE_COUNT_PROBE` (5), `PROMOTE_SESSIONS` (2), `GLOBAL_PROJECTS` (2), `TTL_DAYS` (60), `NOISE_TTL_DAYS` (7), `REVIEW_FIRES` (10), `MAX_GATES` (2000), `HEAL_SUCCESSES` (3), `DEMOTE_RECURRENCES` (3), `DEMOTE_OVERRIDES` (5).
+Tunables are named constants at the top of `index.ts` and `src/store.ts`: `PROMOTE_COUNT` (3), `PROMOTE_COUNT_PROBE` (5), `PROMOTE_SESSIONS` (2), `GLOBAL_PROJECTS` (2), `TTL_DAYS` (60), `NOISE_TTL_DAYS` (7), `REVIEW_FIRES` (10), `MAX_GATES` (2000), `HEAL_SUCCESSES` (3), `DEMOTE_RECURRENCES` (3), `DEMOTE_REOFFENSE_SESSIONS` (2), `DEMOTE_OVERRIDES` (5), `TAUGHT_REMINDERS` (5).
 
 ## Roadmap
 

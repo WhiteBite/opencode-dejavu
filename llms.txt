@@ -19,18 +19,35 @@ and failing again in the same session escalates to a hard BLOCK.
 - Two scopes: project gates in `<repo>/.opencode/dejavu/gates.json` escalate
   to global `~/.config/opencode/dejavu/gates.json` after appearing in 2+
   project directories.
-- Blocking policy: only non-diagnostic bash commands may block; file probes
-  and diagnostics stay `watching` forever (`canBlock()` in src/patterns.ts).
-- Secret scrubbing before any persistence (OpenAI/Anthropic/AWS/GitHub/Slack/
-  Stripe/JWT/PEM/DB-conn patterns).
+- Three enforcement tiers: only non-diagnostic bash with residual identity may
+  block; diagnostics/iteration commands land in `reminding` (remind, never
+  block); everything else stays `watching`. Over-generic (fully
+  parameterized) signatures never enforce at any tier.
+- Sanitization before any persistence: secret scrubbing (OpenAI/Anthropic/
+  AWS/GitHub/Slack/Stripe/JWT/PEM/DB-conn patterns) + terminal control-char
+  stripping (`sanitizeForStore`).
 - Gates expire after 60 days without recurrence; `recurredAfterGate` is the
-  health metric; `scripts/doctor.ts` reports all pathology classes.
+  health metric — and it acts: enforced gates that keep failing (3+) or keep
+  getting overridden (5+) demote themselves to watching (`feedbackDemoted`).
+  Gates that taught their lesson (reminded 5+ times, zero reoffense) retire
+  softly (`retired-taught`). `scripts/doctor.ts` reports all pathology
+  classes and discovers project stores from the global index when run
+  without arguments.
 - `DEJAVU_HOME` env var overrides the global store directory (testing,
   custom setups).
 - Companion agent skill (skills/dejavu/SKILL.md) and `/dejavu` status command
   (command/dejavu.md).
 
 ## Installation
+
+npm (recommended):
+
+```jsonc
+// ~/.config/opencode/opencode.json
+{ "plugin": ["opencode-dejavu"] }
+```
+
+From source:
 
 ```bash
 git clone https://github.com/WhiteBite/opencode-dejavu ~/.config/opencode/vendor/dejavu
@@ -49,6 +66,8 @@ export { Dejavu } from "../vendor/dejavu/index.ts"
   scrubbing, failure detection, blocking policy, fuzzy matching
 - [src/store.ts](./src/store.ts): GateStore/Stores — two-scope persistence,
   lockfiles, promotion, TTL expiry, migration
+- [src/validate.ts](./src/validate.ts): gate parse/repair boundary
+  (strict parse + mechanical repair)
 - [test/smoke.ts](./test/smoke.ts): behavioral smoke test (`bun test/smoke.ts`)
 - [scripts/doctor.ts](./scripts/doctor.ts): pathology report
 - [scripts/analyze.ts](./scripts/analyze.ts): store summary

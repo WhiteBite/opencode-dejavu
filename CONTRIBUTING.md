@@ -16,9 +16,9 @@ Every PR must pass both. New behavior = new smoke check (`test/smoke.ts` is a pl
 
 - No semicolons, double quotes, explicit return types, `node:` prefixes, JSDoc on exports.
 - Catch blocks swallow deliberately **with a rationale comment**; only `GateSignal` is rethrown from hooks.
-- Anything persisted goes through `scrubSecrets()` first — signatures, snippets, args, corrections, logs.
-- `canBlock()` in `src/patterns.ts` is the single source of truth for blocking policy; file probes and diagnostics never block.
-- Bump `PLUGIN_VERSION` in `src/store.ts` on behavior changes (doctor detects version drift via init log events) and add a `CHANGELOG.md` entry.
+- Anything persisted goes through `sanitizeForStore()` first (secret scrub + terminal control-char strip) — signatures, snippets, args, corrections, logs.
+- `canBlock()`/`canRemind()` in `src/patterns.ts` are the single source of truth for enforcement policy; file probes never enforce, diagnostics/iteration commands never block, over-generic signatures enforce at no tier.
+- Bump `PLUGIN_VERSION` in `src/store.ts` AND `version` in `package.json` on behavior changes (doctor detects version drift via init log events) and add a `CHANGELOG.md` entry.
 
 ## PRs
 
