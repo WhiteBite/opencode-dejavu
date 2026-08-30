@@ -17,8 +17,8 @@ The call you were about to make has failed repeatedly in the past. The call was 
 2. Read `Last failure:` and `Correction:` in the message.
 3. Diagnose the root cause (read the relevant file, check the environment, run a diagnostic command).
 4. Retry with a **changed** approach — a different command, fixed arguments, or a prerequisite step first.
-5. If you are confident the situation changed (e.g. you just installed the missing dependency), retry as-is. A repeated failure after a reminder escalates the gate to a hard block within this session.
-6. `dejavu:proceed` (as a comment/argument inside the call) bypasses the gate. Use it ONLY when the user explicitly asked you to force the operation, or you have concrete proof the gate is stale. Every override is logged.
+5. If you are confident the situation changed (e.g. you just installed the missing dependency), retry as-is — a SUCCESS clears your session from the gate's chain. On a blocking gate, a repeated failure after a reminder escalates it to a hard block within this session; a reminding gate (diagnostics/iteration commands) never blocks, it only reminds.
+6. `dejavu:proceed` (as a trailing COMMENT inside the call — `# dejavu:proceed`) bypasses the gate. Use it ONLY when the user explicitly asked you to force the operation, or you have concrete proof the gate is stale. Every override is logged; on blocking gates it is ALSO counted on the gate, and repeated overrides demote the gate (your bypasses are feedback: a gate everyone works around retires itself). If you override and the call SUCCEEDS, say so when improving the gate — that proves it stale.
 
 ## When you get `[dejavu] BLOCKED`
 
@@ -45,4 +45,4 @@ Do NOT:
 - `read`/`edit`/`write` failures on files (via tool-level error events)
 - counts, distinct sessions, distinct projects; patterns seen in 2+ projects become global (they are your habits, not the repo's quirks)
 
-Gates expire after 60 days without recurrence. A gate that fires 10+ times without the error recurring is flagged `review: true` in its file.
+Gates expire after 60 days without recurrence. Gates listen to behavior in both directions: a gate whose error keeps recurring under enforcement (3+ times) or that gets overridden repeatedly (5+ on blocking gates) demotes itself to `watching` + `feedbackDemoted` and stops enforcing — if you later learn it was right, a human re-enforces it by setting its `status` back to `blocking`/`reminding` AND clearing `feedbackDemoted` in gates.json (the gate gets a fresh grace window). A gate blocked 10+ times is flagged `review: true` in its file. A gate that taught its lesson (reminded 5+ times, never reoffended) retires softly too — if a retired gate starts failing again, it re-promotes on its own.
