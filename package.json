@@ -1,6 +1,6 @@
 {
   "name": "opencode-dejavu",
-  "version": "2.16.0",
+  "version": "2.17.0",
   "description": "Cross-session memory prosthesis for OpenCode: detects recurring tool-call failures and promotes them into enforced gates. Remind first, block on same-session repeat offense.",
   "type": "module",
   "main": "index.ts",

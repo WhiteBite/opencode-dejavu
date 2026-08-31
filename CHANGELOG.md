@@ -1,5 +1,19 @@
 # Changelog
 
+## 2.17.0 — 2026-08-31
+
+### Fixed (production-data analysis: exit-1 immunity was breaking on real-world command shapes)
+Found by reading the accumulated store data (doctor + analyze across all projects): the dominant NOT-TEACHING / REMINDERS-IGNORED / ANNOYING / FLAPPY noise was test and type-check commands being **gated on ordinary test failures** — exactly the "the failures are the work" case the immunity exists for. Three root causes:
+
+- **Piping a diagnostic into a PowerShell formatter broke immunity** — `flutter test --no-pub 2>&1 | Select-Object -Last 5` (and `Tee-Object`, etc.): the formatter segment is not in `DIAGNOSTIC_VERBS`, so the "every chain segment must be diagnostic" rule denied immunity and the test's exit-1 became a gate. PowerShell pipeline formatters never set the exit code (`$LASTEXITCODE` stays with the producing native command), so they are now transparent to the check. A real non-diagnostic producer still gates (`npm install | select-object` still counts).
+- **A leading `cd <path> &&` broke immunity** — `cd X && npx tsc --noEmit`: the navigation segment is non-diagnostic and denied immunity even though only the diagnostic can fail. Navigation (`cd`/`set-location`/`pushd`/`popd`) is now transparent. (`cd` alone still gates — a bare `cd` to a bad path is a real recurring mistake.)
+- **`npm test` / `yarn test` / `pnpm test` were not recognized as diagnostics** — the test-runner list covered pytest/jest/vitest/etc. but not the npm/yarn/pnpm script runners, so their ordinary test failures gated. Added. (`npm run build` stays non-diagnostic — a build failure is a real error, not "the work".)
+
+The `deploy --broken && grep done` hazard (a later diagnostic hiding a real failure) is unchanged and still denied.
+
+### Systemic lesson
+- An allowlist rule ("every segment must be diagnostic") is only as good as its segment model: segments that never produce the exit code (pipe formatters, `cd`) must be transparent to it, or the rule false-fires on the exact shapes agents use to trim noisy output (`… | Select-Object -Last 5`). Real production data was the only thing that surfaced this — the synthetic immunity tests all used bare or `&&`-chained commands.
+
 ## 2.16.0 — 2026-08-30
 
 ### Added (implementing the three deferred audit items)

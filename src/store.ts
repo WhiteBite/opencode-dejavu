@@ -5,7 +5,7 @@ import { canBlock, canRemind, fuzzySimilar, FUZZY_MAX_LEN, hasResidualIdentity, 
 import { coerceGateShape, repairGate } from "./validate"
 
 /** Bumped on behavior changes; stamped into init log events so stale sessions are visible. */
-export const PLUGIN_VERSION = "2.16.0"
+export const PLUGIN_VERSION = "2.17.0"
 
 export interface Gate {
   /** sha1 signature prefix — the pattern identity */

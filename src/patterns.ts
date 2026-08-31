@@ -217,6 +217,9 @@ const DIAGNOSTIC_VERBS: RegExp[] = [
   /\bgit grep\b/i,
   /(^|[\s|;&:])diff\b/i,
   /\b(pytest|jest|vitest|mocha|cucumbertest)\b/i,
+  // npm/yarn/pnpm test scripts are test runners too — their exit 1 is "tests
+  // failed" (the work), not an infrastructure error.
+  /\b(npm|pnpm|yarn) (run )?test\b/i,
   /\bplaywright test\b/i,
   /\bflutter (test|analyze)\b/i,
   /\bdart (analyze|format|fix)\b/i,
@@ -244,11 +247,25 @@ export function isDiagnosticSignature(signature: string): boolean {
   return isDiagnosticText(signature)
 }
 
+/** PowerShell pipeline formatters shape output but never set the pipeline's
+ * exit code (`$LASTEXITCODE` stays with the producing native command) — so
+ * piping a diagnostic into one (`tsc | Select-Object -Last 5`) must not break
+ * the diagnostic's exit-1 immunity. */
+const PIPE_FORMATTERS =
+  /^\s*(select-object|sort-object|format-table|format-list|format-wide|format-custom|out-string|out-host|out-null|tee-object|foreach-object|where-object|measure-object|group-object|convertto-json|convertfrom-json)\b/i
+/** Navigation changes directory, never the outcome — `cd X && <diagnostic>`
+ * must not lose the diagnostic's exit-1 immunity to the `cd` segment. */
+const NAVIGATION_VERBS = /^\s*(cd|set-location|pushd|popd)\b/i
+
 /**
  * OpenCode normalizes non-zero exits to 1 in metadata, so discriminate by
  * command shape. Exit-1 immunity requires EVERY chain segment to be
  * diagnostic: in `deploy --broken && grep done log.txt` the exit is deploy's
  * failure — granting immunity because grep appears later would hide it.
+ * Two segment kinds are transparent to this check because they can never be
+ * the failing producer: pipe formatters (output shaping) and navigation
+ * (`cd`). A real non-diagnostic command still breaks immunity — `npm install |
+ * select-object` still counts (npm install is not a diagnostic).
  * Paren groups are flattened to segment separators (`;`), NOT spaces:
  * splitChain keeps `(deploy && grep)` as ONE segment, and flattening to
  * spaces would merge `deploy (grep x)` into one segment where a diagnostic
@@ -258,7 +275,9 @@ export function isDiagnosticSignature(signature: string): boolean {
  */
 export function isIntendedNonzero(command: string, exitCode: number): boolean {
   if (exitCode !== 1) return false
-  const segments = splitChain(command.replace(/[()]/g, ";"))
+  const segments = splitChain(command.replace(/[()]/g, ";")).filter(
+    (segment) => !PIPE_FORMATTERS.test(segment) && !NAVIGATION_VERBS.test(segment),
+  )
   return segments.length > 0 && segments.every((segment) => isDiagnosticText(segment))
 }
 

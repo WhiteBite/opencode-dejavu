@@ -1265,6 +1265,19 @@ check("mixed chain loses exit-1 immunity (deploy failure not hidden by grep)", !
 check("all-diagnostic chain keeps exit-1 immunity", isIntendedNonzero("grep a file && grep b file", 1))
 check("single diagnostic command keeps exit-1 immunity", isIntendedNonzero("grep foo bar.txt", 1))
 check("exit 2 is never intended", !isIntendedNonzero("grep foo bar.txt", 2))
+// Pipe-formatter and navigation transparency: a formatter/navigation segment can
+// never be the failing producer, so it must not break a diagnostic's immunity.
+check("pipe to Select-Object keeps the diagnostic's immunity", isIntendedNonzero("flutter test --no-pub 2>&1 | Select-Object -Last 5", 1))
+check("pipe to Tee-Object keeps the diagnostic's immunity", isIntendedNonzero("npx tsc --noEmit 2>&1 | Tee-Object -filepath out.txt", 1))
+check("leading cd does not break the diagnostic's immunity", isIntendedNonzero("cd D:\\proj && npx tsc --noEmit 2>&1", 1))
+check("npm test is a diagnostic (tests failing = the work)", isIntendedNonzero("npm test", 1))
+check("npm run test:bdd is a diagnostic", isIntendedNonzero("npm run test:bdd 2>&1 | Select-Object -Last 5", 1))
+check("yarn/pnpm test are diagnostics", isIntendedNonzero("yarn test", 1) && isIntendedNonzero("pnpm test", 1))
+// Transparency must not hide a real non-diagnostic producer: npm install piped
+// to a formatter still counts (npm install is not a diagnostic).
+check("non-diagnostic piped to a formatter still counts", !isIntendedNonzero("npm install | Select-Object -Last 5", 1))
+check("non-diagnostic after cd still counts", !isIntendedNonzero("cd D:\\proj && npm install", 1))
+check("npm run build is not a test runner (build failures gate)", !isIntendedNonzero("npm run build", 1))
 
 // --- 65. taught retirement: clean reminders retire the gate softly ---
 const taughtDir = join(tmp, "taught-project")
