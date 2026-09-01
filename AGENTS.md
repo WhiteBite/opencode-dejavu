@@ -112,6 +112,11 @@ Line numbers intentionally omitted — they rot every round; locate by symbol na
 - Global forensics for deferred events: deferred events bypass `logAll`'s routing, so the project store mirrors its salient deferred events (`demoted`/`retired-healed`) into the global log via `routeSalientTo` — direct events are not mirrored there (logAll already routes them)
 - Windows-first fs: `\\?\` long-path prefix, tmp+rename with EPERM/EACCES/EBUSY backoff, lockfile with stale-steal and 3s degrade-to-unlocked (never hang the tool pipeline)
 
+## GIT HOOKS
+
+- commit-msg hygiene hook: `scripts/githooks/commit-msg` — header ≤100 chars, no emoji, no AI attribution trailers; matches trailer structure, so plain tool-name mentions pass
+- Activate once per clone: `git config core.hooksPath scripts/githooks`
+
 ## COMMANDS
 
 ```bash

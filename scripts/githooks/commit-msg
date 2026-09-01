@@ -1,0 +1,46 @@
+#!/bin/sh
+# commit-msg hygiene: header length, emoji, AI attribution.
+# Matches trailer structure, not bare tool names - plain mentions pass.
+# Activate once per clone: git config core.hooksPath scripts/githooks
+
+MSG_FILE="$1"
+[ -f "$MSG_FILE" ] || exit 0
+
+fail() {
+  printf '\ncommit-msg rejected: %s\n%s\n' "$1" "$2"
+  exit 1
+}
+
+header=$(grep -v '^#' "$MSG_FILE" | grep -m 1 -v '^[[:space:]]*$')
+
+if printf '%s\n' "$header" | grep -qE '^.{101,}$'; then
+  fail "header longer than 100 chars" \
+       "Keep the subject to one line; move detail into the body."
+fi
+
+# Emoji: UTF-8 byte prefixes of pictograph blocks (works on any grep, C-locale safe).
+# U+1F000+ plane = all modern emoji; U+2600-27BF and U+2B40+ = symbol/dingbat blocks.
+if grep -q "$(printf '\360\237')" "$MSG_FILE" \
+  || grep -q "$(printf '\342\230')" "$MSG_FILE" \
+  || grep -q "$(printf '\342\231')" "$MSG_FILE" \
+  || grep -q "$(printf '\342\232')" "$MSG_FILE" \
+  || grep -q "$(printf '\342\233')" "$MSG_FILE" \
+  || grep -q "$(printf '\342\234')" "$MSG_FILE" \
+  || grep -q "$(printf '\342\235')" "$MSG_FILE" \
+  || grep -q "$(printf '\342\236')" "$MSG_FILE" \
+  || grep -q "$(printf '\342\255')" "$MSG_FILE"; then
+  fail "commit message contains emoji" \
+       "No emoji in commit messages."
+fi
+
+if grep -qiE '^[[:space:]]*co-authored-by:[[:space:]].*(claude|codex|copilot|chatgpt|gemini|devin|anthropic|openai|cursor|qwen|noreply)' "$MSG_FILE"; then
+  fail "AI co-author trailer" \
+       "No AI attribution: remove the Co-authored-by line."
+fi
+
+if grep -qiE '(generated|created|written|authored|produced)[[:space:]]+(with|by|using)[[:space:]].*(claude|codex|copilot|chatgpt|gemini|devin|cursor|opencode|anthropic|openai)' "$MSG_FILE"; then
+  fail "AI generation footer" \
+       "No AI attribution: remove the 'Generated with ...' footer."
+fi
+
+exit 0
