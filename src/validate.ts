@@ -199,6 +199,13 @@ export function repairGate(gate: Gate): boolean {
     gate.status = "watching"
     changed = true
   }
+  // recurredAfterReminder accrues only while blocking (after-hook); a tier
+  // demotion leaves a stale value that would block taught-retirement (which
+  // requires it === 0). Clear it once the gate is no longer blocking.
+  if (gate.status !== "blocking" && gate.recurredAfterReminder > 0) {
+    gate.recurredAfterReminder = 0
+    changed = true
+  }
   return changed
 }
 

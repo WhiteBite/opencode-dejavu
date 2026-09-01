@@ -1333,12 +1333,35 @@ const antiNagRemindDir = join(tmp, "antinag-remind-project")
 const ANTI_NAG_REMIND_CMD = "npm test"
 const antiNagRemindKey = patternKey(callSignature("bash", { command: ANTI_NAG_REMIND_CMD }) ?? "")
 await seedGates(antiNagRemindDir, [
-  seedGate({ key: antiNagRemindKey, signature: `bash:${ANTI_NAG_REMIND_CMD}`, status: "blocking", remindedCount: 4, recurredAfterReminder: 3, recurredAfterGate: 0 }),
+  // recurredAfterGate>0 blocks the taught check, so this isolates the anti-nag
+  // status guard (the gate must stay reminding, not be retired by anti-nag).
+  seedGate({ key: antiNagRemindKey, signature: `bash:${ANTI_NAG_REMIND_CMD}`, status: "blocking", remindedCount: 4, recurredAfterReminder: 3, recurredAfterGate: 2 }),
 ])
 const hooksANR = await Dejavu({ directory: antiNagRemindDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
 await attemptWith(hooksANR)(ANTI_NAG_REMIND_CMD, "anr1", "anr1")
 const antiNagRemindGate = (await readJson(join(antiNagRemindDir, ".opencode", "dejavu", "gates.json"))).find((g) => g.key === antiNagRemindKey)
 check("anti-nag: a reminding gate with a stale counter is NOT retired", antiNagRemindGate?.feedbackDemoted !== true && antiNagRemindGate?.status !== "watching")
+
+// --- 65d. a tier demotion clears the stale recurredAfterReminder, unblocking
+// taught-retirement. Same legacy gate as 65c, but with zero recurredAfterGate so
+// the (now-cleared) counter lets the taught check fire: the gate retires SOFTLY
+// (watching, no feedbackDemoted) instead of reminding forever. ---
+const staleCtrDir = join(tmp, "stale-counter-project")
+const STALE_CTR_CMD = "npm test"
+const staleCtrKey = patternKey(callSignature("bash", { command: STALE_CTR_CMD }) ?? "")
+await seedGates(staleCtrDir, [
+  seedGate({ key: staleCtrKey, signature: `bash:${STALE_CTR_CMD}`, status: "blocking", remindedCount: 4, recurredAfterReminder: 3, recurredAfterGate: 0 }),
+])
+const hooksStaleCtr = await Dejavu({ directory: staleCtrDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+await attemptWith(hooksStaleCtr)(STALE_CTR_CMD, "stc1", "stc1")
+const staleCtrGate = (await readJson(join(staleCtrDir, ".opencode", "dejavu", "gates.json"))).find((g) => g.key === staleCtrKey)
+check("stale counter cleared on tier demotion lets the gate taught-retire", staleCtrGate?.status === "watching" && staleCtrGate?.feedbackDemoted !== true)
+
+// --- 65e. bash `|&` (pipe stdout+stderr) is a pipe, and unix `tee` is a
+// formatter — both were kimi3-verifier blind spots. ---
+check("bash |& keeps the diagnostic's immunity", isIntendedNonzero("npm test |& head -5", 1))
+check("diagnostic piped to tee keeps immunity", isIntendedNonzero("npm test 2>&1 | tee out.log", 1))
+check("non-diagnostic piped to tee still counts", !isIntendedNonzero("npm install | tee out.log", 1))
 
 // --- 66. env-prefixed interpreter one-liners are fingerprinted ---
 const envSig = callSignature("bash", { command: 'PYTHONPATH=x python -c "print(1)"' }) ?? ""

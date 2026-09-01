@@ -257,7 +257,7 @@ export function isDiagnosticSignature(signature: string): boolean {
  * exit must still count. isIntendedNonzero only grants the transparency to
  * segments splitChainTagged marks as pipe tails. */
 const PIPE_FORMATTERS =
-  /^\s*(select-object|sort-object|format-table|format-list|format-wide|format-custom|out-string|out-host|out-null|tee-object|foreach-object|where-object|measure-object|group-object|convertto-json|convertfrom-json|head|tail|column|uniq)\b/i
+  /^\s*(select-object|sort-object|format-table|format-list|format-wide|format-custom|out-string|out-host|out-null|tee-object|foreach-object|where-object|measure-object|group-object|convertto-json|convertfrom-json|head|tail|column|uniq|tee)\b/i
 /** Navigation changes directory, never the outcome — `cd X && <diagnostic>`
  * must not lose the diagnostic's exit-1 immunity to the `cd` segment. */
 const NAVIGATION_VERBS = /^\s*(cd|set-location|pushd|popd)\b/i
@@ -321,7 +321,12 @@ function splitChainTagged(command: string): Array<{ text: string; pipeTail: bool
       if (ch === "|") {
         flush()
         if (next === "|") {
+          // `||` is a sequence (OR) separator — next segment is a producer.
           pipeTail = false
+          i += 2
+        } else if (next === "&") {
+          // `|&` is bash's pipe-stdout-and-stderr — still a pipe, next is a tail.
+          pipeTail = true
           i += 2
         } else {
           pipeTail = true
@@ -559,7 +564,8 @@ export function splitChain(command: string): string[] {
       }
       if (ch === "|") {
         flush()
-        i += next === "|" ? 2 : 1
+        // `||` (OR) and `|&` (bash pipe stdout+stderr) are 2-char; bare `|` is 1.
+        i += next === "|" || next === "&" ? 2 : 1
         continue
       }
     }

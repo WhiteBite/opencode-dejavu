@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.19.0 — 2026-08-31
+
+### Fixed (closing the verifier's remaining blind spots — "help, don't nag" cleanup)
+The 2.18.0 `kimi3-verifier` review confirmed ship-ready but listed five pre-existing blind spots. Three were safe and worth closing; two are deliberately left (see Notes).
+
+- **Bash `|&` (pipe stdout+stderr) is now a pipe separator** — `npm test |& head -5` was counted instead of immune because the `&` glued onto the next segment (`& head -5` misses the anchored formatter regex). Both `splitChain` and `splitChainTagged` now consume `|&` as a 2-char pipe, so the tail is a pipe-tail formatter and the diagnostic keeps immunity.
+- **Unix `tee` added to the pipe formatters** — only `tee-object` was recognized, so `npm test | tee out.log` counted. `tee` (a pass-through that exits 0) is now transparent in pipe-tail position; a standalone `tee` producer still counts.
+- **Stale `recurredAfterReminder` cleared on tier demotion** — the counter accrues only while blocking, but a policy demotion (e.g. a legacy blocking `npm test` gate demoted to reminding when it became diagnostic) left the stale value, which blocked taught-retirement (needs it `=== 0`) and let the gate nag until TTL. `repairGate` now zeroes it once the gate is no longer blocking, letting such gates taught-retire softly. Regression tests split the two outcomes by `recurredAfterGate`.
+
+### Notes (two verifier blind spots deliberately NOT fixed)
+- **Single `&` is not treated as a chain separator** — on Windows `&` is the PowerShell **call operator** (`& "C:\…\exe" args`), so splitting on it would break those invocations. Bash-style backgrounding (`A & B`) is rare in agent commands here; leaving it unsplit is the correct call, not a gap.
+- **Manually re-enforced gates keep old session chains** — re-enforcement is a human edit of `gates.json`; the mechanical path (promotion) clears chains, and a human can clear the arrays too. Documented behavior, not a defect.
+
 ## 2.18.0 — 2026-08-31
 
 Theme: **the plugin should help, not nag** — finish closing the immunity blind spots and stop interrupting when interrupting provably does nothing.
