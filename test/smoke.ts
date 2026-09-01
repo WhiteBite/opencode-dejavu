@@ -57,6 +57,7 @@ interface GateRow {
   reoffenseSessions?: string[]
   remindedCount?: number
   recurredAfterGate?: number
+  recurredAfterReminder?: number
 }
 
 let failures = 0
@@ -1278,6 +1279,19 @@ check("yarn/pnpm test are diagnostics", isIntendedNonzero("yarn test", 1) && isI
 check("non-diagnostic piped to a formatter still counts", !isIntendedNonzero("npm install | Select-Object -Last 5", 1))
 check("non-diagnostic after cd still counts", !isIntendedNonzero("cd D:\\proj && npm install", 1))
 check("npm run build is not a test runner (build failures gate)", !isIntendedNonzero("npm run build", 1))
+// Unix output shapers are formatters too — piping a diagnostic into one must
+// keep immunity (real data: `npx vitest … | head -5`, `git show … | head`).
+check("pipe to unix head keeps the diagnostic's immunity", isIntendedNonzero("npx vitest run 2>&1 | head - 5", 1))
+check("pipe to unix tail keeps the diagnostic's immunity", isIntendedNonzero("pytest -q 2>&1 | tail -n 5", 1))
+check("cd + vitest piped to head keeps immunity", isIntendedNonzero("cd D:\\proj && npx vitest run src/tests/x.test.ts 2>&1 | head - 5", 1))
+check("non-diagnostic piped to head still counts", !isIntendedNonzero("npm install | head - 5", 1))
+// Formatter transparency is PIPE-POSITION only: a formatter as the TERMINAL
+// producer of a sequence is the failing producer — its exit must still count
+// (kimi3-verifier counterexample: `npm test` exits 0 under &&, the exit 1 is
+// tail's file-not-found, a real recurring mistake).
+check("formatter as terminal producer still counts (&&)", !isIntendedNonzero("npm test && tail -5 missing.log", 1))
+check("formatter as terminal producer still counts (;)", !isIntendedNonzero("pytest -q; head -5 missing.log", 1))
+check("formatter after || is a producer, not a pipe tail", !isIntendedNonzero("npm test || tail -5 missing.log", 1))
 
 // --- 65. taught retirement: clean reminders retire the gate softly ---
 const taughtDir = join(tmp, "taught-project")
@@ -1290,6 +1304,41 @@ check("the retirement reminder is still delivered", taughtRemind !== null && tau
 check("gate with 5 clean reminders retires to watching (taught)", (await readJson(join(taughtDir, ".opencode", "dejavu", "gates.json"))).find((g) => g.key === taughtKey)?.status === "watching")
 check("retirement logged as retired-taught", (await readFile(join(taughtDir, ".opencode", "dejavu", "log.jsonl"), "utf8")).includes('"type":"retired-taught"'))
 check("retired gate no longer reminds", (await attemptWith(hooksTA)(TAUGHT_CMD, "ta2", "ta2")) === null)
+
+// --- 65b. anti-nag retirement: a blocking gate whose reminders are consistently
+// ignored (agent reoffends in-session right after being reminded) nags instead of
+// teaching — retire it and stop interrupting. Mirror of taught retirement, but
+// marks feedbackDemoted so it does not mechanically re-promote. ---
+const antiNagDir = join(tmp, "antinag-project")
+const ANTI_NAG_CMD = "anti nag deploy cmd"
+const antiNagKey = patternKey(callSignature("bash", { command: ANTI_NAG_CMD }) ?? "")
+await seedGates(antiNagDir, [
+  seedGate({ key: antiNagKey, signature: `bash:${ANTI_NAG_CMD}`, status: "blocking", remindedCount: 5, recurredAfterReminder: 3, recurredAfterGate: 0 }),
+])
+const hooksAN = await Dejavu({ directory: antiNagDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+const antiNagResult = await attemptWith(hooksAN)(ANTI_NAG_CMD, "an1", "an1")
+const antiNagGate = (await readJson(join(antiNagDir, ".opencode", "dejavu", "gates.json"))).find((g) => g.key === antiNagKey)
+check("anti-nag: ignored-reminder gate retires to watching + feedbackDemoted", antiNagGate?.status === "watching" && antiNagGate?.feedbackDemoted === true)
+check("anti-nag: the nagging call proceeds without interruption", antiNagResult === null)
+check("anti-nag: retirement logged", (await readFile(join(antiNagDir, ".opencode", "dejavu", "log.jsonl"), "utf8")).includes("anti-nag retirement"))
+check("anti-nag: counters reset so a manual re-enforce gets a fresh start", antiNagGate?.remindedCount === 0 && antiNagGate?.recurredAfterReminder === 0)
+check("anti-nag: gate no longer reminds afterwards", (await attemptWith(hooksAN)(ANTI_NAG_CMD, "an2", "an2")) === null)
+
+// --- 65c. anti-nag must NOT fire on a reminding gate. recurredAfterReminder
+// accrues only while blocking, but a tier demotion (repairGate/migrate) keeps
+// the stale counter: npm test became diagnostic in 2.17.0, so a legacy BLOCKING
+// npm-test gate with recurredAfterReminder>=3 is demoted to reminding at init
+// and must not then be retired on that stale evidence. ---
+const antiNagRemindDir = join(tmp, "antinag-remind-project")
+const ANTI_NAG_REMIND_CMD = "npm test"
+const antiNagRemindKey = patternKey(callSignature("bash", { command: ANTI_NAG_REMIND_CMD }) ?? "")
+await seedGates(antiNagRemindDir, [
+  seedGate({ key: antiNagRemindKey, signature: `bash:${ANTI_NAG_REMIND_CMD}`, status: "blocking", remindedCount: 4, recurredAfterReminder: 3, recurredAfterGate: 0 }),
+])
+const hooksANR = await Dejavu({ directory: antiNagRemindDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+await attemptWith(hooksANR)(ANTI_NAG_REMIND_CMD, "anr1", "anr1")
+const antiNagRemindGate = (await readJson(join(antiNagRemindDir, ".opencode", "dejavu", "gates.json"))).find((g) => g.key === antiNagRemindKey)
+check("anti-nag: a reminding gate with a stale counter is NOT retired", antiNagRemindGate?.feedbackDemoted !== true && antiNagRemindGate?.status !== "watching")
 
 // --- 66. env-prefixed interpreter one-liners are fingerprinted ---
 const envSig = callSignature("bash", { command: 'PYTHONPATH=x python -c "print(1)"' }) ?? ""

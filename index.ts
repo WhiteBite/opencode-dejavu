@@ -26,6 +26,13 @@ const REVIEW_FIRES = 10
  * its lesson — the agent changes behavior, so no success can ever heal it
  * (the wc-l loop); retire it softly (re-promotion stays possible) */
 const TAUGHT_REMINDERS = 5
+/** anti-nag retirement (the negative twin of taught): a gate reminded this many
+ * times whose reminders are CONSISTENTLY IGNORED (>= ANTI_NAG_REOFFENSE
+ * immediate in-session reoffenses) is nagging, not teaching — stop enforcing.
+ * Unlike taught retirement it marks feedbackDemoted: behavior already voted
+ * against the gate, so mechanical re-promotion would just restart the nag loop. */
+const ANTI_NAG_REMINDERS = 5
+const ANTI_NAG_REOFFENSE = 3
 /** a "retry" arriving this soon after a reminder was dispatched concurrently with it
  * (same tool-call burst) and never saw the reminder — it gets reminded as well.
  * A true agent retry needs a full model turn (≥1s in practice), so 500ms separates both. */
@@ -340,6 +347,45 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
                 snippet: `reminded ${fresh.remindedCount}x with zero reoffense — teaching worked, retired to watching`,
               })
               signal = new GateSignal(remindMessage(fresh))
+              return
+            }
+            // Anti-nag retirement (the negative twin of taught retirement): many
+            // reminders whose advice is consistently ignored (the agent reoffends
+            // in-session right after being reminded) mean the gate NAGS instead of
+            // teaching — stop enforcing. Unlike taught retirement, mark
+            // feedbackDemoted: behavior already voted against the gate, so
+            // mechanical re-promotion would just restart the nag loop; a human can
+            // still re-enforce manually (status + clearing feedbackDemoted). No
+            // reminder is delivered and the call proceeds — interrupting is exactly
+            // what stopped helping.
+            // Gated to status === "blocking": recurredAfterReminder accrues ONLY
+            // while blocking (the after-hook), but a tier demotion (repairGate /
+            // migrate) preserves the stale counter on a reminding gate — without
+            // the status check such a gate would be retired on someone else's old
+            // evidence. Resetting the counters on fire means a manual re-enforce
+            // gets a genuinely fresh start instead of instantly re-triggering.
+            if (
+              firstEncounter &&
+              fresh.status === "blocking" &&
+              fresh.remindedCount >= ANTI_NAG_REMINDERS &&
+              fresh.recurredAfterReminder >= ANTI_NAG_REOFFENSE
+            ) {
+              const nagReminded = fresh.remindedCount
+              const nagReoffended = fresh.recurredAfterReminder
+              fresh.status = "watching"
+              fresh.feedbackDemoted = true
+              fresh.feedbackBaseline = { recurred: fresh.recurredAfterGate, overrides: fresh.overrideCount }
+              fresh.remindedCount = 0
+              fresh.recurredAfterReminder = 0
+              await target.store.save()
+              pendingLogs.push({
+                type: "demoted",
+                key: fresh.key,
+                tool: fresh.tool,
+                session,
+                project: directory,
+                snippet: `anti-nag retirement (reminded ${nagReminded}x, reoffended ${nagReoffended}x) — reminders ignored, stopped enforcing`,
+              })
               return
             }
             await target.store.save()

@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.18.0 — 2026-08-31
+
+Theme: **the plugin should help, not nag** — finish closing the immunity blind spots and stop interrupting when interrupting provably does nothing.
+
+### Fixed (production-data follow-up: the immunity fix had a formatter blind spot)
+Re-ran doctor/analyze on the accumulated stores after 2.17.0 and found a live case the immunity still broke: `cd <path> && npx vitest run … >& <n> | head - <n>` (MidasAI). 2.17.0 made the **PowerShell** pipeline formatters (`Select-Object`, `Tee-Object`, …) transparent, but not the **unix** output shapers — so piping a diagnostic into `head`/`tail`/`column`/`uniq` still counted the ordinary test failure.
+
+- **Unix output shapers added to the transparent formatters** — `head`, `tail`, `column`, `uniq` join the PowerShell cmdlets in `PIPE_FORMATTERS`. Piping a diagnostic into one keeps its exit-1 immunity; a non-diagnostic piped into a formatter still counts (`npm install | head -5` still gates), and a bare formatter as the producer still gates.
+- **Formatter transparency is pipe-position only** — an independent review (`kimi3-verifier`) refuted the first cut, which was separator-blind and over-granted: `npm test && tail -5 missing.log` became immune even though `npm test` exits 0 under `&&` and the exit 1 is `tail`'s file-not-found (a real recurring mistake). Transparency now applies only to segments `splitChainTagged` marks as **pipe tails** (`|`); a formatter as a `;`/`&&`/`||` terminal producer is the failing producer and its exit still counts.
+
+### Added (anti-nag retirement — the negative twin of taught retirement)
+- **Anti-nag retirement** — a **blocking** gate reminded `ANTI_NAG_REMINDERS` (5) times whose advice is consistently ignored (`recurredAfterReminder >= ANTI_NAG_REOFFENSE` (3): the agent reoffends in-session right after being reminded) is nagging, not teaching. On the next first-encounter it retires to `watching` + `feedbackDemoted`, the call proceeds **without** a reminder, and the event is logged (`demoted`, "anti-nag retirement"). Mirrors taught retirement (same hook point, same lock, first-encounter only) but marks `feedbackDemoted` so it does not mechanically re-promote into the nag loop; a human can re-enforce manually. Two guards the independent review forced: (1) `status === "blocking"` in the condition — `recurredAfterReminder` accrues only while blocking but a tier demotion keeps the stale counter, so a reminding/diagnostic gate demoted from a legacy blocking one must not be retired on someone else's old evidence; (2) the counters are **reset on fire**, so a manual re-enforce gets a genuinely fresh start instead of instantly re-triggering.
+
+### Note (independent verification)
+This release was hardened by a read-only adversarial review (`kimi3-verifier`) that refuted two over-claims in the first cut (the separator-blind formatter over-grant; anti-nag firing on a reminding gate via a stale counter) plus a manual-re-enforce trap. All three are fixed above with regression tests; typecheck + full smoke suite green.
+
 ## 2.17.0 — 2026-08-31
 
 ### Fixed (production-data analysis: exit-1 immunity was breaking on real-world command shapes)

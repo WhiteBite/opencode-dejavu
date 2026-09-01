@@ -247,25 +247,107 @@ export function isDiagnosticSignature(signature: string): boolean {
   return isDiagnosticText(signature)
 }
 
-/** PowerShell pipeline formatters shape output but never set the pipeline's
- * exit code (`$LASTEXITCODE` stays with the producing native command) — so
- * piping a diagnostic into one (`tsc | Select-Object -Last 5`) must not break
- * the diagnostic's exit-1 immunity. */
+/** Pipeline formatters shape output but are never the failing producer WHEN
+ * they are a pipe tail: PowerShell cmdlets don't set `$LASTEXITCODE` (it stays
+ * with the producing native command), and unix head/tail/column/uniq tails exit
+ * 0 on piped input. So piping a diagnostic into one (`tsc | Select-Object -Last
+ * 5`, `vitest | head -5`) must not break the diagnostic's exit-1 immunity.
+ * Position matters: a formatter standing alone or as the TERMINAL producer of a
+ * sequence (`npm test && tail -5 missing.log`) IS the failing producer — its
+ * exit must still count. isIntendedNonzero only grants the transparency to
+ * segments splitChainTagged marks as pipe tails. */
 const PIPE_FORMATTERS =
-  /^\s*(select-object|sort-object|format-table|format-list|format-wide|format-custom|out-string|out-host|out-null|tee-object|foreach-object|where-object|measure-object|group-object|convertto-json|convertfrom-json)\b/i
+  /^\s*(select-object|sort-object|format-table|format-list|format-wide|format-custom|out-string|out-host|out-null|tee-object|foreach-object|where-object|measure-object|group-object|convertto-json|convertfrom-json|head|tail|column|uniq)\b/i
 /** Navigation changes directory, never the outcome — `cd X && <diagnostic>`
  * must not lose the diagnostic's exit-1 immunity to the `cd` segment. */
 const NAVIGATION_VERBS = /^\s*(cd|set-location|pushd|popd)\b/i
 
+/** Like splitChain but tags each segment with whether it immediately follows a
+ * pipe (`|`). Formatter transparency is position-dependent (pipe tail only), so
+ * the immunity check needs this. `||` is a sequence (OR) separator, not a pipe:
+ * the segment after it is a producer, NOT a pipe tail. */
+function splitChainTagged(command: string): Array<{ text: string; pipeTail: boolean }> {
+  const segments: Array<{ text: string; pipeTail: boolean }> = []
+  let current = ""
+  let quote: string | null = null
+  let depth = 0
+  let pipeTail = false
+  const flush = (): void => {
+    const trimmed = current.trim()
+    if (trimmed !== "") segments.push({ text: trimmed, pipeTail })
+    current = ""
+  }
+  let i = 0
+  while (i < command.length) {
+    const ch = command.charAt(i)
+    const next = command.charAt(i + 1)
+    if (quote !== null) {
+      current += ch
+      if (ch === quote) quote = null
+      i += 1
+      continue
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch
+      current += ch
+      i += 1
+      continue
+    }
+    if (ch === "(") {
+      depth += 1
+      current += ch
+      i += 1
+      continue
+    }
+    if (ch === ")") {
+      depth = Math.max(0, depth - 1)
+      current += ch
+      i += 1
+      continue
+    }
+    if (depth === 0) {
+      if (ch === ";" || ch === "\n" || ch === "\r") {
+        flush()
+        pipeTail = false
+        i += 1
+        continue
+      }
+      if (ch === "&" && next === "&") {
+        flush()
+        pipeTail = false
+        i += 2
+        continue
+      }
+      if (ch === "|") {
+        flush()
+        if (next === "|") {
+          pipeTail = false
+          i += 2
+        } else {
+          pipeTail = true
+          i += 1
+        }
+        continue
+      }
+    }
+    current += ch
+    i += 1
+  }
+  flush()
+  return segments
+}
+
 /**
  * OpenCode normalizes non-zero exits to 1 in metadata, so discriminate by
- * command shape. Exit-1 immunity requires EVERY chain segment to be
+ * command shape. Exit-1 immunity requires EVERY producer segment to be
  * diagnostic: in `deploy --broken && grep done log.txt` the exit is deploy's
  * failure — granting immunity because grep appears later would hide it.
- * Two segment kinds are transparent to this check because they can never be
- * the failing producer: pipe formatters (output shaping) and navigation
- * (`cd`). A real non-diagnostic command still breaks immunity — `npm install |
- * select-object` still counts (npm install is not a diagnostic).
+ * Two segment kinds are transparent because they cannot be the failing
+ * producer: navigation (`cd`) anywhere, and pipe formatters — but the latter
+ * ONLY as a pipe tail. A formatter standing alone or as the terminal producer
+ * of a sequence (`npm test && tail -5 missing.log`) IS the producer, so its
+ * failure still counts. A real non-diagnostic command still breaks immunity —
+ * `npm install | select-object` still counts (npm install is not a diagnostic).
  * Paren groups are flattened to segment separators (`;`), NOT spaces:
  * splitChain keeps `(deploy && grep)` as ONE segment, and flattening to
  * spaces would merge `deploy (grep x)` into one segment where a diagnostic
@@ -275,10 +357,14 @@ const NAVIGATION_VERBS = /^\s*(cd|set-location|pushd|popd)\b/i
  */
 export function isIntendedNonzero(command: string, exitCode: number): boolean {
   if (exitCode !== 1) return false
-  const segments = splitChain(command.replace(/[()]/g, ";")).filter(
-    (segment) => !PIPE_FORMATTERS.test(segment) && !NAVIGATION_VERBS.test(segment),
-  )
-  return segments.length > 0 && segments.every((segment) => isDiagnosticText(segment))
+  let sawProducer = false
+  for (const { text, pipeTail } of splitChainTagged(command.replace(/[()]/g, ";"))) {
+    if (NAVIGATION_VERBS.test(text)) continue
+    if (pipeTail && PIPE_FORMATTERS.test(text)) continue
+    if (!isDiagnosticText(text)) return false
+    sawProducer = true
+  }
+  return sawProducer
 }
 
 // --- Residual identity (over-generic shape guard) ----------------------------
