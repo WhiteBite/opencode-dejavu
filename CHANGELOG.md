@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.20.0 — 2026-09-03
+
+### Fixed (residual immunity blind spots found in post-restart production data)
+Re-checked the stores after the 2.19.0 restart: immunity held for 27 of 30 post-restart diagnostic failures, but three residual shapes still gated ordinary iteration work. All three closed:
+
+- **`cd` + diagnostic in one segment no longer dropped as navigation** — `cd packages/foo npx vitest run …` (no separator between the path and the command) was dropped wholesale as navigation, hiding the diagnostic and breaking immunity. Navigation is now transparent only when the segment is PURE navigation; a segment pairing a nav verb with a diagnostic keeps the diagnostic. A bare `cd /bad/path` still counts (not immune).
+- **Subshell-paren flattening no longer breaks PowerShell script blocks** — `Select-String … | ForEach-Object { $_.line.trim() }` was gated because the blanket `()→;` flatten split the `.trim()` method-call parens inside the `{ }` script block. New `flattenSubshellParens` flattens parens only OUTSIDE `{}` braces and quotes, so method-call parens stay part of their segment while `(deploy && grep)` still splits (a diagnostic nested in parens must not blanket-immunize a non-diagnostic).
+- **`npm/pnpm/yarn` `typecheck`/`lint` are diagnostics** — production `npm run typecheck` was reminded 20+ times because only `test` was recognized; `typecheck`/`lint` join it, including the flags-between form (`pnpm --filter <pkg> typecheck`). `npm run build` stays non-diagnostic (a build failure is a real error, not the work).
+
+### Note (deliberate non-goal)
+The point of these fixes is NOT to enumerate every command in every language — that is whack-a-mole. The durable design is (a) cover the common iteration commands broadly and (b) let anti-nag retirement self-correct anything that still slips through and nags. Both are now in place.
+
 ## 2.19.0 — 2026-08-31
 
 ### Fixed (closing the verifier's remaining blind spots — "help, don't nag" cleanup)

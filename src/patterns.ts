@@ -217,9 +217,12 @@ const DIAGNOSTIC_VERBS: RegExp[] = [
   /\bgit grep\b/i,
   /(^|[\s|;&:])diff\b/i,
   /\b(pytest|jest|vitest|mocha|cucumbertest)\b/i,
-  // npm/yarn/pnpm test scripts are test runners too — their exit 1 is "tests
-  // failed" (the work), not an infrastructure error.
-  /\b(npm|pnpm|yarn) (run )?test\b/i,
+  // npm/yarn/pnpm test / typecheck / lint scripts are iteration work — their
+  // exit 1 is "tests failed / types wrong / lint found issues", not an
+  // infrastructure error. The second rule covers flags between the package
+  // manager and the verb (e.g. `pnpm --filter <pkg> typecheck`).
+  /\b(npm|pnpm|yarn) (run )?(test|typecheck|lint)\b/i,
+  /\b(npm|pnpm|yarn)\b[^\n;|&]*\b(typecheck|lint)\b/i,
   /\bplaywright test\b/i,
   /\bflutter (test|analyze)\b/i,
   /\bdart (analyze|format|fix)\b/i,
@@ -261,6 +264,46 @@ const PIPE_FORMATTERS =
 /** Navigation changes directory, never the outcome — `cd X && <diagnostic>`
  * must not lose the diagnostic's exit-1 immunity to the `cd` segment. */
 const NAVIGATION_VERBS = /^\s*(cd|set-location|pushd|popd)\b/i
+
+/** Flatten subshell parens to `;` segment separators, but ONLY outside `{}`
+ * script blocks and quotes. `(deploy && grep)` must split (a diagnostic inside
+ * parens must not blanket-immunize a non-diagnostic verb), but method-call
+ * parens inside a PowerShell script block (`ForEach-Object { $_.trim() }`) are
+ * part of that segment and must NOT split it. */
+function flattenSubshellParens(command: string): string {
+  let result = ""
+  let quote: string | null = null
+  let braceDepth = 0
+  for (let i = 0; i < command.length; i++) {
+    const ch = command.charAt(i)
+    if (quote !== null) {
+      result += ch
+      if (ch === quote) quote = null
+      continue
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch
+      result += ch
+      continue
+    }
+    if (ch === "{") {
+      braceDepth += 1
+      result += ch
+      continue
+    }
+    if (ch === "}") {
+      braceDepth = Math.max(0, braceDepth - 1)
+      result += ch
+      continue
+    }
+    if ((ch === "(" || ch === ")") && braceDepth === 0) {
+      result += ";"
+      continue
+    }
+    result += ch
+  }
+  return result
+}
 
 /** Like splitChain but tags each segment with whether it immediately follows a
  * pipe (`|`). Formatter transparency is position-dependent (pipe tail only), so
@@ -348,23 +391,28 @@ function splitChainTagged(command: string): Array<{ text: string; pipeTail: bool
  * diagnostic: in `deploy --broken && grep done log.txt` the exit is deploy's
  * failure — granting immunity because grep appears later would hide it.
  * Two segment kinds are transparent because they cannot be the failing
- * producer: navigation (`cd`) anywhere, and pipe formatters — but the latter
- * ONLY as a pipe tail. A formatter standing alone or as the terminal producer
- * of a sequence (`npm test && tail -5 missing.log`) IS the producer, so its
- * failure still counts. A real non-diagnostic command still breaks immunity —
- * `npm install | select-object` still counts (npm install is not a diagnostic).
- * Paren groups are flattened to segment separators (`;`), NOT spaces:
- * splitChain keeps `(deploy && grep)` as ONE segment, and flattening to
- * spaces would merge `deploy (grep x)` into one segment where a diagnostic
- * anywhere blanket-immunizes the non-diagnostic verb. Splitting at parens
- * keeps command-level granularity (a diagnostic nested as a sub-expression
- * argument does not immunize the outer command).
+ * producer: navigation (`cd`) — but ONLY when the segment is pure navigation,
+ * so `cd <path> npx vitest run` (no separator) keeps the diagnostic instead of
+ * being dropped wholesale — and pipe formatters, but the latter ONLY as a pipe
+ * tail. A formatter standing alone or as the terminal producer of a sequence
+ * (`npm test && tail -5 missing.log`) IS the producer, so its failure still
+ * counts. A real non-diagnostic command still breaks immunity — `npm install |
+ * select-object` still counts (npm install is not a diagnostic).
+ * Subshell paren groups are flattened to segment separators (`;`), NOT spaces,
+ * and only OUTSIDE `{}` script blocks: `(deploy && grep)` splits so a
+ * diagnostic nested in parens can't blanket-immunize a non-diagnostic verb,
+ * while method-call parens inside a script block (`ForEach-Object { $_.trim()
+ * }`) stay part of their segment and don't split it.
  */
 export function isIntendedNonzero(command: string, exitCode: number): boolean {
   if (exitCode !== 1) return false
   let sawProducer = false
-  for (const { text, pipeTail } of splitChainTagged(command.replace(/[()]/g, ";"))) {
-    if (NAVIGATION_VERBS.test(text)) continue
+  for (const { text, pipeTail } of splitChainTagged(flattenSubshellParens(command))) {
+    // Navigation is transparent only when it is PURE navigation. A segment that
+    // pairs a navigation verb with a diagnostic and no separator between them
+    // (`cd <path> npx vitest run ...`) must keep that diagnostic — dropping the
+    // whole segment as navigation would hide the command and break immunity.
+    if (NAVIGATION_VERBS.test(text) && !isDiagnosticText(text)) continue
     if (pipeTail && PIPE_FORMATTERS.test(text)) continue
     if (!isDiagnosticText(text)) return false
     sawProducer = true

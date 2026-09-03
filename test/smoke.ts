@@ -1293,6 +1293,28 @@ check("formatter as terminal producer still counts (&&)", !isIntendedNonzero("np
 check("formatter as terminal producer still counts (;)", !isIntendedNonzero("pytest -q; head -5 missing.log", 1))
 check("formatter after || is a producer, not a pipe tail", !isIntendedNonzero("npm test || tail -5 missing.log", 1))
 
+// Navigation is transparent only when PURE: a navigation verb paired with a
+// diagnostic and NO separator between them must keep the diagnostic — dropping
+// the whole segment as navigation hid the command and broke immunity (prod:
+// `cd <path> npx vitest run ...` was being gated).
+check("cd + diagnostic in one segment keeps immunity", isIntendedNonzero("cd packages/sourcesiphon npx vitest run src/tests/walker.test.ts 2>&1 | Select-Object -Last 5", 1))
+check("pure cd alone still counts (not immune)", !isIntendedNonzero("cd /nonexistent/path", 1))
+check("cd && diagnostic keeps immunity (separator form)", isIntendedNonzero("cd packages/foo && npx vitest run 2>&1 | Select-Object -Last 5", 1))
+
+// Subshell-paren flattening must NOT break PowerShell script blocks: the () in
+// a method call inside { } (e.g. ForEach-Object { $_.trim() }) is part of that
+// segment, not a chain separator (prod: select-string | ForEach-Object was gated).
+check("script-block method-call parens keep immunity", isIntendedNonzero("Select-String -path tests\\foo.test.ts -pattern bar | ForEach-Object { $_.line.trim() }", 1))
+check("(deploy && grep) still splits — non-diagnostic not hidden", !isIntendedNonzero("(deploy --broken && grep done log.txt)", 1))
+
+// npm/pnpm/yarn typecheck + lint are iteration work (the typecheck gap: prod
+// `npm run typecheck` reminded 20+ times because only `npm test` was a
+// diagnostic). Includes the `--filter <pkg>` form.
+check("npm run typecheck is a diagnostic", isIntendedNonzero("npm run typecheck 2>&1", 1))
+check("npm run lint is a diagnostic", isIntendedNonzero("npm run lint 2>&1 | Select-Object -Last 3", 1))
+check("pnpm --filter typecheck is a diagnostic", isIntendedNonzero("pnpm --filter @midasai/midas-ui typecheck 2>&1 | Select-Object -Last 5", 1))
+check("npm run build is NOT a diagnostic (real failure)", !isIntendedNonzero("npm run build 2>&1", 1))
+
 // --- 65. taught retirement: clean reminders retire the gate softly ---
 const taughtDir = join(tmp, "taught-project")
 const TAUGHT_CMD = "taught retirement cmd"
