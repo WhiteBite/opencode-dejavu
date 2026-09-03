@@ -76,6 +76,15 @@ function remindMessage(gate: Gate): string {
   ].join("\n")
 }
 
+// reminding twin of remindMessage: appended to the failing output, not thrown
+function remindNote(gate: Gate): string {
+  return [
+    `[dejavu] NOTE — this exact call has failed ${gate.count}x across ${gate.sessions.length} session(s); it is a watched diagnostic, so the run was NOT interrupted.`,
+    `Last failure: ${gate.snippet}`,
+    `Correction (weigh, don't execute blindly): ${gate.correction ?? "Do not retry unchanged; diagnose the root cause first."}`,
+  ].join("\n")
+}
+
 function blockMessage(gate: Gate, storeDir: string): string {
   return [
     `[dejavu] BLOCKED — you were reminded about this failing call in this session, retried it, and it failed again.`,
@@ -249,11 +258,7 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
           // Overrides are the sanctioned bypass — surface them loudly; a
           // prompt-injected agent overriding everything must be noticeable.
           await logClient("warn", `dejavu: override (dejavu:proceed) for gate ${gate.key} "${gate.signature}" in session ${session}`)
-          // Negative feedback: overrides are counted ON the gate. A gate the
-          // agent keeps bypassing is friction, not teaching — demote it.
-          // Reminding gates are exempt: they never block, the marker merely
-          // skips one interrupting reminder — avoiding the interruption is
-          // rational agent behavior, not friction with the teaching.
+          // overrides demote blocking gates (friction); reminding gates never interrupt, so exempt
            const overrideTarget = found
           let demotedEvent: LogEvent | null = null
           await overrideTarget.store.runLocked(async () => {
@@ -286,6 +291,9 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
           }
           return
         }
+
+        // reminding gates never interrupt — the note rides on the failing output (after-hook)
+        if (gate.status === "reminding") return
 
         // Enforce from FRESH gate state under the store lock. The remind→block
         // chain lives on the gate itself (remindedSessions/failedSessions), so
@@ -523,6 +531,8 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
         // every window serving this session sees the same remind→block chain.
         const ownerStore = result.wentGlobal ? stores.globalStore : result.store
         const escalationLogs: LogEvent[] = []
+        // reminding notes are appended to the failing output after the lock, once per session
+        let annotation: string | null = null
         await ownerStore.runLocked(async () => {
           const fresh = (await ownerStore.load(true)).find((g) => g.key === result.gate.key)
           if (fresh === undefined) return
@@ -566,6 +576,37 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
             fresh.recurredAfterReminder += 1
             changed = true
           }
+          // first failure this session annotates; same-session repeats accrue ignored-note anti-nag
+          if (fresh.status === "reminding") {
+            if (fresh.remindedSessions?.[session] === undefined) {
+              if (fresh.remindedSessions === undefined) fresh.remindedSessions = {}
+              fresh.remindedSessions[session] = Date.now()
+              fresh.remindedCount += 1
+              changed = true
+              escalationLogs.push({ type: "reminded", key: fresh.key, tool: input.tool, session, project: directory, via: "exact" })
+              annotation = remindNote(fresh)
+            } else {
+              fresh.recurredAfterReminder += 1
+              changed = true
+              if (fresh.remindedCount >= ANTI_NAG_REMINDERS && fresh.recurredAfterReminder >= ANTI_NAG_REOFFENSE) {
+                const nagReminded = fresh.remindedCount
+                const nagReoffended = fresh.recurredAfterReminder
+                fresh.status = "watching"
+                fresh.feedbackDemoted = true
+                fresh.feedbackBaseline = { recurred: fresh.recurredAfterGate, overrides: fresh.overrideCount }
+                fresh.remindedCount = 0
+                fresh.recurredAfterReminder = 0
+                escalationLogs.push({
+                  type: "demoted",
+                  key: fresh.key,
+                  tool: input.tool,
+                  session,
+                  project: directory,
+                  snippet: `anti-nag retirement (reminded ${nagReminded}x, reoffended ${nagReoffended}x) — reminders ignored, stopped enforcing`,
+                })
+              }
+            }
+          }
           if (changed) await ownerStore.save()
         })
         // Logging stays OUT of the gate lock (see the before-hook).
@@ -578,6 +619,7 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
           // A logging failure must not break the tool pipeline.
           logHookError("after", error)
         }
+        if (annotation !== null && typeof output?.output === "string") output.output = output.output + "\n\n" + annotation
       } catch (error) {
         // detection failures must never break the tool pipeline — but stay visible
         logHookError("after", error)

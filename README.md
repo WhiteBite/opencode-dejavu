@@ -19,9 +19,11 @@ Cross-session **memory prosthesis with teeth** for [OpenCode](https://github.com
 tool call fails  →  signature normalized (paths/numbers/hashes stripped)
                  →  pattern-key counted, sessions tracked
                  →  3 failures across 2 distinct sessions  →  gate promoted
-next attempt     →  [dejavu] REMINDER thrown (call aborted, agent sees the correction)
-retry fails again →  same-session repeat offense → hard BLOCK on further attempts
-```
+ next attempt     →  [dejavu] REMINDER thrown (call aborted, agent sees the correction)
+ retry fails again →  same-session repeat offense → hard BLOCK on further attempts
+ diagnostic cmd   →  gate stays remind-only: the call RUNS and the reminder rides
+                     on the failing output as a [dejavu] NOTE (once per session)
+ ```
 
 Design decisions (post-mortem of existing approaches):
 
@@ -62,7 +64,7 @@ Restart OpenCode. Gates appear automatically as failures recur — nothing to co
 
 ## Robustness & safety
 
-- **Blocking policy** — only `bash` commands that are NOT diagnostics may ever become blocking gates. Diagnostics and iteration commands (tsc/eslint/mypy/pytest/gradle-test/flutter/curl/grep, `dart run`, `go run|build|test|vet`, `cargo run|build|test|clippy`...) promote to `reminding` — they signal but never block, so iterating on tests/builds is never punished. File probes (read/edit/write/glob/grep) stay `watching`: measured, visible in reports, never interrupting. `canBlock()`/`canRemind()` in `src/patterns.ts` are the single source of truth. Signatures without residual identity (see above) enforce at no tier.
+- **Blocking policy** — only `bash` commands that are NOT diagnostics may ever become blocking gates. Diagnostics and iteration commands (tsc/eslint/mypy/pytest/gradle-test/flutter/curl/grep, `dart run`, `go run|build|test|vet`, `cargo run|build|test|clippy`...) promote to `reminding` — they annotate the failing output with a `[dejavu] NOTE` (once per session) and never block or interrupt the run, so iterating on tests/builds is never punished. File probes (read/edit/write/glob/grep) stay `watching`: measured, visible in reports, never interrupting. `canBlock()`/`canRemind()` in `src/patterns.ts` are the single source of truth. Signatures without residual identity (see above) enforce at no tier.
 - **One-liner identity** — for `python -c` / `node -e` / `bun -e` and friends the code payload IS the call, so it is fingerprinted (`<code:hash>`) instead of flattened to `<str>`: different scripts never share a gate, the same script failing repeatedly still converges. PowerShell shapes are covered — quoted exe paths (`& "C:\...\python.exe" -c ...`), here-string payloads, env-prefixed invocations (`PYTHONPATH=x python -c ...`). Legacy bare `-c <str>` shapes never enforce at any tier (residual-identity guard).
 - **Wrapper unwrapping** — `cmd /c|/k "..."` normalizes to the INNER command: the gate key, identity and diagnostic tier all see the real call instead of a `cmd <path> <str>` shape matching every cmd invocation.
 - **Clean persistence** — terminal control characters (PowerShell VT colors, NULs) are stripped before anything touches disk; signatures, snippets and corrections never carry ANSI escapes.

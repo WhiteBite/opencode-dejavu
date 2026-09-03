@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.21.0 — 2026-09-03
+
+### Changed (reminding gates never interrupt — "help, don't nag" completed)
+Two production screenshots showed the same root problem: a reminding (diagnostic) gate aborted the call with a reminder and hid the output, nagging with stale evidence (`flutter test` after the immunity fix; a `dart analyze`+`custom_lint` chain whose "103 issues" predated a cleanup). The reminding tier existed to protect iteration, yet aborting the run was itself punishment for iterating. Now:
+
+- **Reminding gates never abort.** The before-hook lets `reminding`-tier calls straight through; the reminder is delivered as a non-blocking `[dejavu] NOTE` appended to the FAILING output in the after-hook, once per session (a repeat same-session failure only accrues `recurredAfterReminder`, no second note). A run that succeeds produces no note at all — so the stale-evidence nag disappears entirely. Blocking gates are unchanged (remind-abort on first encounter, hard block on same-session repeat).
+- **Anti-nag retirement for reminding gates accrues in the after-hook** — a gate reminded `ANTI_NAG_REMINDERS` (5) times whose notes are consistently ignored (`recurredAfterReminder >= ANTI_NAG_REOFFENSE` (3)) retires to `watching` + `feedbackDemoted`, logged `demoted` ("anti-nag retirement"). Taught retirement deliberately does not apply to reminding gates (a failure event cannot prove a reminder taught anything).
+- **`repairGate` zeroes a stale `recurredAfterReminder` at the blocking→non-blocking demotion transition only** (was: on every load). The counter now accrues legitimately while reminding, so the unconditional reset would have wiped it inside every store lock; tying it to the transition keeps the "no retirement on the previous tier's evidence" guarantee.
+
 ## 2.20.0 — 2026-09-03
 
 ### Fixed (residual immunity blind spots found in post-restart production data)

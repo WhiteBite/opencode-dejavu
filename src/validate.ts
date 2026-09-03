@@ -193,17 +193,12 @@ export function repairGate(gate: Gate): boolean {
   // blocking to reminding if the shape can still remind, else to watching.
   if (gate.status === "blocking" && !canBlock(gate.tool, gate.signature)) {
     gate.status = canRemind(gate.tool, gate.signature) ? "reminding" : "watching"
+    // reset at the transition: the old tier's counter is stale; reminding accrues fresh
+    if (gate.recurredAfterReminder > 0) gate.recurredAfterReminder = 0
     changed = true
   }
   if (gate.status === "reminding" && !canRemind(gate.tool, gate.signature)) {
     gate.status = "watching"
-    changed = true
-  }
-  // recurredAfterReminder accrues only while blocking (after-hook); a tier
-  // demotion leaves a stale value that would block taught-retirement (which
-  // requires it === 0). Clear it once the gate is no longer blocking.
-  if (gate.status !== "blocking" && gate.recurredAfterReminder > 0) {
-    gate.recurredAfterReminder = 0
     changed = true
   }
   return changed

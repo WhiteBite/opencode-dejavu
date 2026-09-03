@@ -324,13 +324,33 @@ await after(
 gates = await readGates()
 check("diagnostic promotes to remind-only (never blocking)", gates.find((g) => g.signature === `bash:${TSC.toLowerCase()}`)?.status === "reminding")
 
-// remind-only gate: reminds, then allows retries forever — never blocks
-const tscRemind = await attempt(TSC, "s52", "t4")
-check("remind-only gate reminds on first encounter", tscRemind !== null && tscRemind.message.includes("[dejavu] REMINDER"))
-await fail(TSC, "s52", "t5") // retry fails again — must NOT escalate to block
-await new Promise((resolve) => setTimeout(resolve, 600))
+// remind-only gate: never aborts — the reminder rides on the failing output
+const tscAttempt = await attempt(TSC, "s52", "t4")
+check("remind-only gate does not abort the call", tscAttempt === null)
+const tscNote = { title: TSC, output: "src/x.ts(1,1): error TS2322: Type 'string' is not assignable", metadata: {} }
+await after(
+  { tool: "bash", sessionID: "s52", callID: "t4", args: { command: TSC } } as unknown as AfterInput,
+  tscNote as unknown as AfterOutput,
+)
+gates = await readGates()
+check("reminding after-hook appends the NOTE to the failing output", tscNote.output.includes("[dejavu] NOTE") && tscNote.output.startsWith("src/x.ts(1,1): error TS2322"))
+check("annotation marks the session on the gate", gates.find((g) => g.signature === `bash:${TSC.toLowerCase()}`)?.remindedSessions?.["s52"] !== undefined)
+const tscNote2 = { title: TSC, output: "src/x.ts(1,1): error TS2322: Type 'string' is not assignable", metadata: {} }
+await after(
+  { tool: "bash", sessionID: "s52", callID: "t5", args: { command: TSC } } as unknown as AfterInput,
+  tscNote2 as unknown as AfterOutput,
+)
+gates = await readGates()
+check("second failing call adds no second annotation", !tscNote2.output.includes("[dejavu] NOTE"))
+check("second failing call increments recurredAfterReminder", gates.find((g) => g.signature === `bash:${TSC.toLowerCase()}`)?.recurredAfterReminder === 1)
 const tscRetry = await attempt(TSC, "s52", "t6")
 check("remind-only gate never blocks after repeated failure", tscRetry === null)
+const tscOk = { title: TSC, output: "ok", metadata: { exit: 0 } }
+await after(
+  { tool: "bash", sessionID: "s52", callID: "t7", args: { command: TSC } } as unknown as AfterInput,
+  tscOk as unknown as AfterOutput,
+)
+check("success on a reminding gate appends no annotation", tscOk.output === "ok")
 
 // --- 12. read output is file CONTENT: text signatures must not apply ---
 await after(
@@ -1156,7 +1176,13 @@ await failOn(hooksIT)(DART_RUN, "it1", "it2")
 await failOn(hooksIT)(DART_RUN, "it2", "it3")
 const itGates = await readJson(join(iterDir, ".opencode", "dejavu", "gates.json"))
 check("dart run promotes to remind-only (iteration verb)", itGates.find((g) => g.signature === `bash:${DART_RUN}`)?.status === "reminding")
-check("reminding-tier reminder says it never blocks", (await attemptWith(hooksIT)(DART_RUN, "it3", "it4"))?.message.includes("never blocks") === true)
+check("reminding-tier gate never interrupts the iteration run", (await attemptWith(hooksIT)(DART_RUN, "it3", "it4")) === null)
+const dartOut = { title: DART_RUN, output: "npm ERR! boom\nExit code: 1", metadata: {} }
+await (hooksIT["tool.execute.after"] as AfterHook)(
+  { tool: "bash", sessionID: "it3", callID: "it4", args: { command: DART_RUN } } as unknown as AfterInput,
+  dartOut as unknown as AfterOutput,
+)
+check("reminding-tier note says the run was NOT interrupted", dartOut.output.includes("NOT interrupted"))
 
 // --- 57. overrides of reminding gates are not counted toward demotion ---
 const ovRemDir = join(tmp, "override-reminding-project")
@@ -1364,10 +1390,8 @@ await attemptWith(hooksANR)(ANTI_NAG_REMIND_CMD, "anr1", "anr1")
 const antiNagRemindGate = (await readJson(join(antiNagRemindDir, ".opencode", "dejavu", "gates.json"))).find((g) => g.key === antiNagRemindKey)
 check("anti-nag: a reminding gate with a stale counter is NOT retired", antiNagRemindGate?.feedbackDemoted !== true && antiNagRemindGate?.status !== "watching")
 
-// --- 65d. a tier demotion clears the stale recurredAfterReminder, unblocking
-// taught-retirement. Same legacy gate as 65c, but with zero recurredAfterGate so
-// the (now-cleared) counter lets the taught check fire: the gate retires SOFTLY
-// (watching, no feedbackDemoted) instead of reminding forever. ---
+// --- 65d. a tier demotion clears the stale recurredAfterReminder at the
+// transition; reminding gates accrue it fresh in the after-hook. ---
 const staleCtrDir = join(tmp, "stale-counter-project")
 const STALE_CTR_CMD = "npm test"
 const staleCtrKey = patternKey(callSignature("bash", { command: STALE_CTR_CMD }) ?? "")
@@ -1377,13 +1401,31 @@ await seedGates(staleCtrDir, [
 const hooksStaleCtr = await Dejavu({ directory: staleCtrDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
 await attemptWith(hooksStaleCtr)(STALE_CTR_CMD, "stc1", "stc1")
 const staleCtrGate = (await readJson(join(staleCtrDir, ".opencode", "dejavu", "gates.json"))).find((g) => g.key === staleCtrKey)
-check("stale counter cleared on tier demotion lets the gate taught-retire", staleCtrGate?.status === "watching" && staleCtrGate?.feedbackDemoted !== true)
+check("tier demotion clears the stale recurredAfterReminder", staleCtrGate?.status === "reminding" && staleCtrGate?.recurredAfterReminder === 0)
+check("demoted reminding gate never interrupts the call", (await attemptWith(hooksStaleCtr)(STALE_CTR_CMD, "stc2", "stc2")) === null)
+await failOn(hooksStaleCtr)(STALE_CTR_CMD, "stc3", "stc3-f1")
+await failOn(hooksStaleCtr)(STALE_CTR_CMD, "stc3", "stc3-f2")
+const staleCtrGate2 = (await readJson(join(staleCtrDir, ".opencode", "dejavu", "gates.json"))).find((g) => g.key === staleCtrKey)
+check("demoted gate is not anti-nag-retired on the previous tier's evidence", staleCtrGate2?.status === "reminding" && staleCtrGate2?.feedbackDemoted !== true)
 
 // --- 65e. bash `|&` (pipe stdout+stderr) is a pipe, and unix `tee` is a
 // formatter — both were kimi3-verifier blind spots. ---
 check("bash |& keeps the diagnostic's immunity", isIntendedNonzero("npm test |& head -5", 1))
 check("diagnostic piped to tee keeps immunity", isIntendedNonzero("npm test 2>&1 | tee out.log", 1))
 check("non-diagnostic piped to tee still counts", !isIntendedNonzero("npm install | tee out.log", 1))
+
+// --- 65f. anti-nag for reminding gates accrues in the after-hook: notes the
+// session keeps ignoring retire the gate. ---
+const nagRemDir = join(tmp, "antinag-note-project")
+const NAG_REM_CMD = "npm test"
+const nagRemKey = patternKey(callSignature("bash", { command: NAG_REM_CMD }) ?? "")
+await seedGates(nagRemDir, [seedGate({ key: nagRemKey, signature: `bash:${NAG_REM_CMD}`, status: "reminding", remindedCount: 4 })])
+const hooksNR = await Dejavu({ directory: nagRemDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+for (const call of ["nr-f1", "nr-f2", "nr-f3", "nr-f4"]) await failOn(hooksNR)(NAG_REM_CMD, "nr-ses", call)
+const nagRemGate = (await readJson(join(nagRemDir, ".opencode", "dejavu", "gates.json"))).find((g) => g.key === nagRemKey)
+check("anti-nag (after-hook): ignored notes retire the reminding gate", nagRemGate?.status === "watching" && nagRemGate?.feedbackDemoted === true)
+check("anti-nag (after-hook): retirement is logged", (await readFile(join(nagRemDir, ".opencode", "dejavu", "log.jsonl"), "utf8")).includes("anti-nag retirement"))
+check("anti-nag (after-hook): counters reset for a manual re-enforce", nagRemGate?.remindedCount === 0 && nagRemGate?.recurredAfterReminder === 0)
 
 // --- 66. env-prefixed interpreter one-liners are fingerprinted ---
 const envSig = callSignature("bash", { command: 'PYTHONPATH=x python -c "print(1)"' }) ?? ""

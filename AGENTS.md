@@ -28,7 +28,7 @@ dejavu-opencode-plugin/
 
 | Task | Location | Notes |
 |------|----------|-------|
-| Gate enforcement (remind/block/override) | `index.ts` `tool.execute.before` | session state lives ON THE GATE (`remindedSessions`/`failedSessions`), read fresh under the store lock |
+| Gate enforcement (remind/block/override) | `index.ts` before/after hooks | blocking gates abort in the before-hook; reminding gates annotate the failing output in the after-hook; session state lives ON THE GATE, read fresh under the store lock |
 | Failure detection + recording | `index.ts` `tool.execute.after` + `event` | two channels: exit/text vs message stream; a cross-channel dedup guard counts one call once |
 | Signature/normalization | `src/patterns.ts` | `callSignature`, `normalizeCommand`, `parameterizeError` |
 | Enforcement policy | `src/patterns.ts:canBlock()`/`canRemind()` | three tiers — bash non-diagnostics block, diagnostics remind-only, everything else just watches |
@@ -77,7 +77,7 @@ Line numbers intentionally omitted — they rot every round; locate by symbol na
 - ESM (`"type": "module"`) + Bun runtime; scripts run directly (`bun scripts/x.ts`); no build, no bundling
 - No semicolons, double quotes, explicit return types on everything, `node:` prefix on builtins
 - No linter/formatter config exists — style is maintained by hand, match neighboring code
-- JSDoc `/** */` on exports; inline `//` comments explain WHY (design rationale), not WHAT
+- JSDoc `/** */` on exports; inline `//` comments explain WHY (design rationale), not WHAT — ONE line max; multi-line comment essays are AI slop and get deleted
 - Catch blocks swallow deliberately with a rationale comment; only `GateSignal` is rethrown
 - Tunables are named UPPER_SNAKE constants grouped under `// --- Section ---` dividers
 
@@ -99,13 +99,13 @@ Line numbers intentionally omitted — they rot every round; locate by symbol na
 ## UNIQUE STYLES
 
 - Two-scope store: project gates in `<repo>/.opencode/dejavu/` (committable) escalate to global `~/.config/opencode/dejavu/` after appearing in 2+ project dirs (agent habits vs repo quirks) — except repo-local verbs (npm/git/gradle/docker/...), which are repo quirks by nature and stay project-scoped forever
-- Three enforcement tiers: `blocking` (remind, then hard-block on same-session repeat), `reminding` (diagnostics — signal without punishing iteration), `watching` (evidence only); `fuzzySimilar` never merges disjoint flag sets but allows subset additions
+- Three enforcement tiers: `blocking` (remind-abort, then hard-block on same-session repeat), `reminding` (diagnostics — annotate the failing output, never interrupt), `watching` (evidence only); `fuzzySimilar` never merges disjoint flag sets but allows subset additions
 - Self-healing stores: every init runs `reconcileAll()` — unparseable files are quarantined (bytes preserved in `*.corrupt-*`, never deleted), records are strictly parsed + mechanically repaired, index is reconciled, and every repair is logged (`repaired`/`quarantined` events); `doctor --repair` does the same on demand — one command replaces hand-debugging
 - Multi-window safe: the remind→block chain is persisted on the gate, not in process memory — several OpenCode windows (each its own process on the shared store) and process restarts all see the same escalation; hot-path reads use a 1s TTL cache + O(1) key index
 - `dejavu:proceed` escape hatch: trailing marker comment, matched with word boundaries, stripped before normalization so bypassed failures land on the original pattern
 - `recurredAfterGate` is THE health metric — gates that fire without killing the error get `review: true`; its mirror `succeededAfterGate` heals gates — 3 consecutive successes on an enforced gate retire it to `watching`, so a fixed command stops reminding
 - Enforcement has negative feedback: 3+ post-gate recurrences or 5+ explicit overrides demote a gate to `watching` + `feedbackDemoted` (never re-promotes mechanically; `feedbackBaseline` gives a human re-enforcement a fresh grace window) — a gate the agent keeps fighting is friction, not teaching; overrides are counted on the gate (`overrideCount`, blocking gates only), demotions log `demoted`
-- The loop closes on success: a SUCCESS on an enforced gate clears that session from the remind→block chain (override + prove-the-fix leaves the session clean) and grows the heal streak — enforcement listens to behavior in both directions; iteration runners (`dart run`, `go run|build|test|vet`, `cargo run|build|test|clippy`) remind but never block
+- The loop closes on success: a SUCCESS on an enforced gate clears that session from the remind→block chain (override + prove-the-fix leaves the session clean) and grows the heal streak — enforcement listens to behavior in both directions; iteration runners (`dart run`, `go run|build|test|vet`, `cargo run|build|test|clippy`) annotate the failing output but never interrupt or block
 - Taught retirement: a gate reminded 5+ times with zero reoffense has taught its lesson (no success can ever heal it — the agent changed behavior) and retires to watching (`retired-taught`); re-promotion on new failures stays possible
 - Retirement damping: a healed/taught-retired gate keeps its lifetime `count`/`sessions`, which alone would clear the promotion bar and re-promote it on the very next single failure (a promote→heal→promote loop). Retirement captures `retireBaseline.count`; re-promotion needs a full fresh bar of failures since retirement (`count − retireBaseline.count ≥ threshold`). Doctor's FLAPPY report watches for the oscillation
 - Cross-channel dedup: one tool call must never be counted twice — the after-hook (exit/text) and the event stream (error parts) are disjoint by construction, but a runtime guard keyed on (key, session) + channel-mismatch window counts a double-firing call once (doctor's CROSS-CHANNEL DOUBLE-COUNT is the observable tripwire). The dedup key is the WHOLE-CALL signature, not the segment-attributed key — the event channel signs the entire call, so a chained command must dedup on one shared identity or it slips through on mismatched keys
