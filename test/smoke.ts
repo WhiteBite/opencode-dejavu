@@ -14,9 +14,15 @@ import {
   callSignature,
   canBlock,
   canRemind,
+  detectFailure,
+  failureSnippet,
   fuzzySimilar,
   hasResidualIdentity,
   isIntendedNonzero,
+  isNoiseError,
+  looksLikeFailure,
+  looksLikeSuccess,
+  nonTransparentProducers,
   normalizeCommand,
   parameterizeError,
   patternKey,
@@ -26,6 +32,7 @@ import {
   suggestCorrection,
 } from "../src/patterns"
 import { DEMOTE_OVERRIDES, GateStore, MAX_SESSIONS, PLUGIN_VERSION, Stores, mergeGate, type Gate } from "../src/store"
+import { repairGate } from "../src/validate"
 
 type Ctx = Parameters<typeof Dejavu>[0]
 type Hooks = Awaited<ReturnType<typeof Dejavu>>
@@ -58,6 +65,7 @@ interface GateRow {
   remindedCount?: number
   recurredAfterGate?: number
   recurredAfterReminder?: number
+  promotionCount?: number
 }
 
 let failures = 0
@@ -1716,7 +1724,10 @@ check("cross-channel duplicate is counted once (dedup guard)", dedupeGate?.count
 const chainDedupeDir = join(tmp, "chain-dedupe-project")
 const CHAIN_SEG_CMD = "gated seg cmd"
 const CHAIN_SEG_SIG = callSignature("bash", { command: CHAIN_SEG_CMD }) ?? ""
-const CHAIN_FULL_CMD = "echo x && gated seg cmd"
+// single non-transparent producer (cd is navigation) — attribution applies, so
+// the after-hook lands on the segment gate while the event channel signs the
+// whole call; dedup must key on the whole-call identity.
+const CHAIN_FULL_CMD = "cd /x && gated seg cmd"
 const CHAIN_FULL_SIG = callSignature("bash", { command: CHAIN_FULL_CMD }) ?? ""
 await seedGates(chainDedupeDir, [
   seedGate({
@@ -1752,6 +1763,212 @@ await (hooksCD.event as EventHook)(
 const chainDedupeGates = await readJson(join(chainDedupeDir, ".opencode", "dejavu", "gates.json"))
 check("chained double-fire is deduped on the whole-call key", !chainDedupeGates.some((g) => g.key === patternKey(CHAIN_FULL_SIG)))
 check("chained failure still attributed to the segment gate once", chainDedupeGates.find((g) => g.key === patternKey(CHAIN_SEG_SIG))?.count === 2)
+
+// --- 85c. multi-producer chains are NOT attributed: with several non-transparent
+// producers the exit code does not say which one failed, so the failure records
+// under the whole call and must NOT inflate a known segment's gate (the
+// playwright-count-56 case: a diagnostic segment inflated by another producer). ---
+const multiAttrDir = join(tmp, "multi-attr-project")
+const MA_SEG_CMD = "gated multi cmd"
+const MA_SEG_SIG = callSignature("bash", { command: MA_SEG_CMD }) ?? ""
+const MA_FULL_CMD = "some-producer --run && gated multi cmd"
+const MA_FULL_SIG = callSignature("bash", { command: MA_FULL_CMD }) ?? ""
+await seedGates(multiAttrDir, [
+  seedGate({
+    key: patternKey(MA_SEG_SIG),
+    signature: MA_SEG_SIG,
+    status: "watching",
+    count: 1,
+    sessions: ["m0"],
+    firstSeen: new Date().toISOString(),
+    lastSeen: new Date().toISOString(),
+  }),
+])
+const hooksMA = await Dejavu({ directory: multiAttrDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+await failOn(hooksMA)(MA_FULL_CMD, "ma1", "ma1")
+const multiAttrGates = await readJson(join(multiAttrDir, ".opencode", "dejavu", "gates.json"))
+check("multi-producer chain is NOT attributed to the known segment", multiAttrGates.find((g) => g.key === patternKey(MA_SEG_SIG))?.count === 1)
+check("multi-producer chain records under the whole-call signature", multiAttrGates.some((g) => g.signature === MA_FULL_SIG))
+
+// --- 87. evidence quality: failureSnippet must never surface a success-shaped
+// tail as the failure evidence (the "17 passed" gate). ---
+check(
+  "failureSnippet picks the error line over a success-shaped tail",
+  failureSnippet("Error: No tests found.\n17 passed (3.1m)", 1) === "Error: No tests found.",
+)
+check("failureSnippet success-only output falls back to the exit code", failureSnippet("17 passed (3.1m)", 1) === "exit code 1")
+check("failureSnippet pwsh not-recognized picks the cause line", failureSnippet("head : The term 'head' is not recognized as the name of a cmdlet.\nCheck the spelling of the name.", 1).includes("is not recognized"))
+check("looksLikeSuccess detects pass summaries", looksLikeSuccess("17 passed (3.1m)") && looksLikeSuccess("1 passed (50.1s)"))
+check("looksLikeSuccess rejects a failure tally", !looksLikeSuccess("1 failed, 1780 passed"))
+check("looksLikeFailure detects errors, rejects pass summaries", looksLikeFailure("ENOENT: no such file") && !looksLikeFailure("17 passed (3.1m)"))
+
+// --- 87b. detection coverage: pwsh not-recognized wording, bare "N failed",
+// "No tests found", generic "Error:" prefix. ---
+check("detectFailure matches pwsh not-recognized wording", detectFailure("head : The term 'head' is not recognized as the name of a cmdlet").matched)
+check("detectFailure matches bare runner summary '1 failed'", detectFailure("1 failed, 1780 passed in 136s").matched)
+check("detectFailure matches 'No tests found'", detectFailure("Error: No tests found.").matched)
+check("detectFailure does not match '0 failed'", !detectFailure("0 failed, 12 passed").matched)
+
+// --- 87c. correction integrity: never quote a success-shaped snippet as
+// "Last error"; new families teach platform-correct fixes. ---
+check("suggestCorrection does not quote a success-shaped snippet", !suggestCorrection("bash:deploy-tool --flag <str>", "17 passed (3.1m)").includes('Last error: "17 passed'))
+check("suggestCorrection quotes a real error line", suggestCorrection("bash:deploy-tool --flag <str>", "ENOENT: no such file or directory").includes("ENOENT"))
+check("suggestCorrection unix-in-powershell family", suggestCorrection("bash:git show --stat <hash> | head - <n>", "The term 'head' is not recognized as the name of a cmdlet").includes("Select-Object"))
+check("suggestCorrection file-not-found family", suggestCorrection("read:entitlements.py", "File not found: D:\\x\\entitlements.py").includes("glob"))
+check("suggestCorrection missing-command family", suggestCorrection("bash:foo-tool --run", "foo-tool: command not found").includes("not installed"))
+
+// --- 87d. repairGate heals legacy success-shaped evidence at the persistence
+// boundary and re-derives the machine template correction (human edits kept). ---
+const rgGate = {
+  key: "000000000001",
+  signature: "bash:deploy-tool --flag <str>",
+  tool: "bash",
+  status: "watching",
+  count: 3,
+  sessions: ["s1", "s2"],
+  projects: [],
+  firstSeen: "2026-01-01T00:00:00.000Z",
+  lastSeen: "2026-01-02T00:00:00.000Z",
+  snippet: "17 passed (3.1m)",
+  correction: 'Last error: "17 passed (3.1m)" — address that specific error before retrying this exact call.',
+  remindedCount: 0,
+  blockedCount: 0,
+  recurredAfterReminder: 0,
+  recurredAfterGate: 0,
+  overrideCount: 0,
+} as Gate
+repairGate(rgGate)
+check("repairGate clears a success-shaped snippet", rgGate.snippet === "")
+check("repairGate re-derives the template correction quoting a success line", rgGate.correction !== undefined && !rgGate.correction.includes('Last error: "17 passed'))
+const rgHuman = { ...rgGate, snippet: "ENOENT: no such file", correction: "Custom human-written advice" } as Gate
+repairGate(rgHuman)
+check("repairGate never touches a human-edited correction", rgHuman.correction === "Custom human-written advice")
+
+// --- 87e. evidence monotonicity: a success-shaped snippet never overwrites a
+// failure-shaped one already on the gate. ---
+const monoDir = join(tmp, "monotonic-project")
+const monoStores = new Stores(new GateStore(join(tmp, "monotonic-global")), new GateStore(monoDir))
+const monoSig = "bash:monotonic evidence cmd"
+const monoKey = patternKey(monoSig)
+await monoStores.recordFailure({ key: monoKey, signature: monoSig, tool: "bash", sessionID: "ms1", projectDir: monoDir, snippet: "Error: real failure line", globalProjects: 99 })
+await monoStores.recordFailure({ key: monoKey, signature: monoSig, tool: "bash", sessionID: "ms1", projectDir: monoDir, snippet: "17 passed (3.1m)", globalProjects: 99 })
+const monoGate = (await new GateStore(monoDir).load(true)).find((g) => g.key === monoKey)
+check("success-shaped snippet does not overwrite a failure-shaped one", monoGate?.snippet === "Error: real failure line")
+
+// --- 87f. infrastructure noise is classified (server-side unavailability),
+// client-side mistakes stay teachable. ---
+check("isNoiseError classifies lsp daemon unreachable", isNoiseError("LSP daemon did not become reachable at \\\\.\\pipe\\omo-lsp-0.1.0-abc"))
+check("isNoiseError classifies webfetch non-2xx", isNoiseError("StatusCodeError: non 2xx status code (503 get https://example.com)"))
+check("isNoiseError classifies MCP streamable-http transport errors", isNoiseError("StreamableHTTPError: Error posting to endpoint"))
+check("isNoiseError classifies webfetch transport error (connection never completed)", isNoiseError("transport error (get https://example.com)"))
+check("isNoiseError does not classify a client-side ENOENT", !isNoiseError("ENOENT: no such file or directory"))
+
+// --- 87g. immunity holes closed: env assignments and start-sleep are
+// transparent, npm run check:* is diagnostic. ---
+check("env-assignment prefix does not break diagnostic immunity", isIntendedNonzero('$env:CI="true"; npx vitest run 2>&1', 1))
+check("start-sleep prefix does not break diagnostic immunity", isIntendedNonzero("start-sleep -seconds 5; npx playwright test 2>&1", 1))
+check("npm run check:* is a diagnostic", isIntendedNonzero("npm run check:bdd-parity 2>&1", 1))
+check("env-assignment + non-diagnostic still counts", !isIntendedNonzero('$env:CI="true"; deploy-tool --broken', 1))
+
+// --- 87h. flag-only wrapper shapes lose residual identity (over-generic). ---
+check("flag-only wrapper loses residual identity and cannot block", !hasResidualIdentity("bash:cmd <path> <str> -f") && !canBlock("bash", "bash:cmd <path> <str> -f"))
+check("wrapper with a real argument keeps identity", hasResidualIdentity("bash:node scripts/foo.js"))
+check("python -m pytest keeps identity", hasResidualIdentity("bash:python -m pytest"))
+check("nonTransparentProducers counts cd/env as transparent", nonTransparentProducers("cd /x && npm test") === 1 && nonTransparentProducers('$env:CI="true"; npx vitest run') === 1)
+check("nonTransparentProducers counts two real producers", nonTransparentProducers("build-tool --run && npm test") === 2)
+
+// --- 87i. promotionCount: lifetime counter, incremented on promotion. ---
+const pcDir = join(tmp, "promo-count-project")
+const PC_CMD = "promo count deploy cmd"
+const pcKey = patternKey(callSignature("bash", { command: PC_CMD }) ?? "")
+const hooksPC = await Dejavu({ directory: pcDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+await failOn(hooksPC)(PC_CMD, "pc1", "pc-f1")
+await failOn(hooksPC)(PC_CMD, "pc1", "pc-f2")
+await failOn(hooksPC)(PC_CMD, "pc2", "pc-f3")
+const pcGate = (await readJson(join(pcDir, ".opencode", "dejavu", "gates.json"))).find((g) => g.key === pcKey)
+check("promotionCount is 1 after the first promotion", pcGate?.status === "blocking" && pcGate?.promotionCount === 1)
+
+// --- 87j. reminding taught retirement: clean reminders retire a diagnostic
+// gate softly (no feedbackDemoted), re-promotion stays possible. ---
+const rtDir = join(tmp, "remind-taught-project")
+const RT_CMD = "npm test"
+const rtKey = patternKey(callSignature("bash", { command: RT_CMD }) ?? "")
+await seedGates(rtDir, [seedGate({ key: rtKey, signature: `bash:${RT_CMD}`, status: "reminding", remindedCount: 5 })])
+const hooksRT = await Dejavu({ directory: rtDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+await failOn(hooksRT)(RT_CMD, "rt1", "rt-f1")
+const rtGate = (await readJson(join(rtDir, ".opencode", "dejavu", "gates.json"))).find((g) => g.key === rtKey)
+check("reminding gate retires to watching after clean reminders (taught)", rtGate?.status === "watching" && rtGate?.feedbackDemoted !== true)
+check("reminding taught retirement is logged", (await readFile(join(rtDir, ".opencode", "dejavu", "log.jsonl"), "utf8")).includes('"type":"retired-taught"'))
+
+// --- 87k. save() stamps lastInitVersion with the writer's plugin version. ---
+const livDir = join(tmp, "liv-project")
+const livStore = new GateStore(livDir)
+await livStore.runLocked(async () => {
+  const gates = await livStore.load(true)
+  gates.push({
+    key: "000000000099",
+    signature: "bash:liv test",
+    tool: "bash",
+    status: "watching",
+    count: 1,
+    sessions: ["l1"],
+    projects: [],
+    firstSeen: new Date().toISOString(),
+    lastSeen: new Date().toISOString(),
+    snippet: "exit code 1",
+    remindedCount: 0,
+    blockedCount: 0,
+    recurredAfterReminder: 0,
+    recurredAfterGate: 0,
+    overrideCount: 0,
+  })
+  await livStore.save()
+})
+check("save stamps lastInitVersion with the plugin version", (JSON.parse(await readFile(join(livDir, "gates.json"), "utf8")) as { lastInitVersion?: string }).lastInitVersion === PLUGIN_VERSION)
+
+// --- 88. cross-language generalization battery. The evidence engine must not be
+// biased to the JS/Python/PowerShell formats it was tuned on: every ecosystem's
+// failing output must be DETECTED with a real evidence line (not "exit code 1"),
+// and every ecosystem's passing summary must be rejected as evidence. Guard
+// against the "0 failed" pass tally reading as a failure. ---
+const xlFail = (name: string, output: string): void => {
+  const detection = detectFailure(output)
+  check(`xlang ${name}: failure detected`, detection.matched)
+  const snippet = failureSnippet(output, 1)
+  check(`xlang ${name}: evidence is a real line, not "exit code 1"`, snippet !== "exit code 1" && snippet !== "")
+}
+xlFail("go test", "--- FAIL: TestFoo (0.00s)\n    main_test.go:10: expected 5, got 3\nFAIL\nexit status 1")
+xlFail("cargo build", "error[E0308]: mismatched types\n --> src/main.rs:2:18\nerror: could not compile `crate` due to 1 previous error")
+xlFail("cargo test", "test result: FAILED. 1 passed; 1 failed; 0 ignored")
+xlFail("maven", "[ERROR] Tests run: 11, Failures: 1, Errors: 0, Skipped: 0\n[INFO] BUILD FAILURE")
+xlFail("gradle", "> Task :test FAILED\n3 tests completed, 1 failed\nFAILURE: Build failed with an exception.\nBUILD FAILED in 3s")
+xlFail("rspec", "Failures:\n\n  1) Foo fails\n     Failure/Error: expect(5).to eq(3)\n\nFinished in 0.02 seconds\n1 example, 1 failure")
+xlFail("dotnet test", "  Failed TestFoo [1 ms]\n  Error Message:\n    Assert.Equal() Failure\n\nFailed!  - Failed: 1, Passed: 10, Skipped: 0, Total: 11")
+xlFail("dotnet build", "Program.cs(10,5): error CS1002: ; expected\nBuild FAILED.")
+xlFail("phpunit", "1) FooTest::testBar\nFailed asserting that 3 matches expected 5.\n\nFAILURES!\nTests: 2, Assertions: 3, Failures: 1.")
+xlFail("elixir mix test", "  1) test foo (MyModuleTest)\n     Assertion with == failed\n\n1 test, 1 failure, 0 excluded")
+xlFail("sbt test", "[info] *** 1 TEST FAILED ***\n[error] Failed: Total 19, Failed 1, Errors 0, Passed 18")
+xlFail("python unittest", "FAIL: test_something (__main__.TestExample)\nAssertionError: 1 != 2\nFAILED (failures=1)")
+xlFail("node --test TAP", "not ok 1 - fails\n# tests 1\n# pass 0\n# fail 1")
+xlFail("pytest", "FAILED tests/test_foo.py::test_foo - assert 5 == 3\n========================= 1 failed, 9 passed in 0.05s =========================")
+xlFail("jest", "Test Suites: 1 failed, 1 total\nTests:       14 passed, 1 failed, 15 total")
+
+// Passing summaries are never failure evidence — substring match, any decoration.
+check("xlang rust pass summary rejected", looksLikeSuccess("test result: ok. 10 passed; 0 failed; 0 ignored"))
+check("xlang pytest decorated pass summary rejected", looksLikeSuccess("========================= 10 passed in 0.16s ========================="))
+check("xlang gradle pass summary rejected", looksLikeSuccess("BUILD SUCCESSFUL in 3s"))
+check("xlang phpunit pass summary rejected", looksLikeSuccess("OK (2 tests, 3 assertions)"))
+check("xlang go pass summary rejected", looksLikeSuccess("ok  \texample.com/pkg\t0.001s"))
+check("xlang dotnet pass summary rejected", looksLikeSuccess("Passed!  - Failed: 0, Passed: 11, Skipped: 0, Total: 11"))
+
+// A "0 failed" pass tally must never read as a failure, and must be rejected as
+// evidence even when it is the tail of a failing run's output.
+check("xlang '0 failed' pass tally is not a failure", !looksLikeFailure("test result: ok. 10 passed; 0 failed; 0 ignored"))
+check("xlang 'Failed: 0' pass tally is not a failure", !looksLikeFailure("Passed!  - Failed: 0, Passed: 11, Skipped: 0"))
+check(
+  "xlang pass-summary tail of a failing run is skipped for the real error",
+  failureSnippet("error: real cause\n17 passed (3.1m)", 1) === "error: real cause",
+)
 
 // --- 86. round-8 invariant: a corrupt GLOBAL gates.json is quarantined under the
 // gates lock by reconcile(); the unlocked routing peeks in reconcileAll (escalation

@@ -223,6 +223,9 @@ const DIAGNOSTIC_VERBS: RegExp[] = [
   // manager and the verb (e.g. `pnpm --filter <pkg> typecheck`).
   /\b(npm|pnpm|yarn) (run )?(test|typecheck|lint)\b/i,
   /\b(npm|pnpm|yarn)\b[^\n;|&]*\b(typecheck|lint)\b/i,
+  // `npm run check:*` / `verify:*` scripts are iteration work like test/lint —
+  // their exit 1 is "found issues", not an infrastructure error.
+  /\b(npm|pnpm|yarn|bun) (run )?(check|verify)\b/i,
   /\bplaywright test\b/i,
   /\bflutter (test|analyze)\b/i,
   /\bdart (analyze|format|fix)\b/i,
@@ -264,6 +267,11 @@ const PIPE_FORMATTERS =
 /** Navigation changes directory, never the outcome — `cd X && <diagnostic>`
  * must not lose the diagnostic's exit-1 immunity to the `cd` segment. */
 const NAVIGATION_VERBS = /^\s*(cd|set-location|pushd|popd)\b/i
+/** Pure environment assignments (`$env:CI="true"`, `FOO=bar`) and sleeps only
+ * prepare the session — they are never the failing producer, so they are
+ * transparent to exit-1 immunity and chain attribution like navigation. */
+const ENV_ASSIGNMENT_SEGMENT = /^\s*(?:\$env:)?[a-z_][a-z0-9_]*\s*=\s*(?:"[^"]*"|'[^']*'|\S+)\s*$/i
+const INERT_VERBS = /^\s*start-sleep\b/i
 
 /** Flatten subshell parens to `;` segment separators, but ONLY outside `{}`
  * script blocks and quotes. `(deploy && grep)` must split (a diagnostic inside
@@ -413,11 +421,36 @@ export function isIntendedNonzero(command: string, exitCode: number): boolean {
     // (`cd <path> npx vitest run ...`) must keep that diagnostic — dropping the
     // whole segment as navigation would hide the command and break immunity.
     if (NAVIGATION_VERBS.test(text) && !isDiagnosticText(text)) continue
+    // Session prep that cannot be the failing producer: a pure `$env:X=...` /
+    // `FOO=bar` assignment, and start-sleep.
+    if (ENV_ASSIGNMENT_SEGMENT.test(text)) continue
+    if (INERT_VERBS.test(text)) continue
     if (pipeTail && PIPE_FORMATTERS.test(text)) continue
     if (!isDiagnosticText(text)) return false
     sawProducer = true
   }
   return sawProducer
+}
+
+/**
+ * Count of non-transparent producer segments in a command chain — the segments
+ * that could plausibly be the failing producer (everything except pure
+ * navigation, pure env assignments, inert verbs, and pipe-tail formatters).
+ * Chain attribution is only defensible when exactly ONE such producer exists;
+ * with several, the exit code does not say which one failed, so attributing
+ * the failure to any single known segment fabricates evidence (a diagnostic
+ * segment's gate inflated by a non-diagnostic producer's failure).
+ */
+export function nonTransparentProducers(command: string): number {
+  let count = 0
+  for (const { text, pipeTail } of splitChainTagged(flattenSubshellParens(command))) {
+    if (NAVIGATION_VERBS.test(text) && !isDiagnosticText(text)) continue
+    if (ENV_ASSIGNMENT_SEGMENT.test(text)) continue
+    if (INERT_VERBS.test(text)) continue
+    if (pipeTail && PIPE_FORMATTERS.test(text)) continue
+    count += 1
+  }
+  return count
 }
 
 // --- Residual identity (over-generic shape guard) ----------------------------
@@ -433,6 +466,11 @@ const OPERATOR_TOKENS = new Set(["&", "@", ">", "<", ">&", ">>", "2>&1", "2>"])
  * `-m`/`--module` included: the NEXT token is the program, exactly like -c —
  * `python -m <str>` (quoted module) must not gain identity from the flag. */
 const CODE_PASSING_FLAGS = new Set(["-c", "-e", "--eval", "-command", "-encodedcommand", "-m", "--module"])
+
+/** Bare flag tokens (`-x`, `--foo`) are switches, not call identity — after a
+ * wrapper head, a flag-only remainder matches an entire command family
+ * (`cmd <path> <str> -f`), which must not enforce. */
+const FLAG_TOKEN = /^--?[a-z]/i
 
 /** Shell builtins that only position the session: a chain headed by one
  * (`cd <path> && python <path>`) must not borrow identity from the builtin —
@@ -486,11 +524,12 @@ function segmentHasIdentity(segment: string): boolean {
   if (NO_IDENTITY_HEADS.has(head)) return false
   if (!WRAPPER_BASENAMES.has(baseName(head))) return true
   // Wrapper/interpreter head: identity must come from a surviving argument
-  // (a literal path/script, or a <code:...> fingerprint).
+  // (a literal path/script, or a <code:...> fingerprint). Flags are switches,
+  // not identity — a flag-only remainder is an over-generic command family.
   for (let i = headIdx + 1; i < tokens.length; i++) {
     const token = tokens[i] ?? ""
     if (token.startsWith("<code:")) return true
-    if (PLACEHOLDER_TOKEN.test(token) || CODE_PASSING_FLAGS.has(token) || OPERATOR_TOKENS.has(token)) continue
+    if (PLACEHOLDER_TOKEN.test(token) || CODE_PASSING_FLAGS.has(token) || OPERATOR_TOKENS.has(token) || FLAG_TOKEN.test(token)) continue
     return true
   }
   return false
@@ -807,17 +846,87 @@ export interface FailureDetection {
  * event channel instead.
  */
 const FAILURE_SIGNATURES: RegExp[] = [
-  /exit code:?\s*[1-9]\d*/i,
+  /exit (?:code|status):?\s*[1-9]\d*/i,
   /\berror TS\d+\b/,
   /\bENOENT\b|\bEACCES\b|\bEPERM\b/,
   /command not found/i,
-  /is not recognized as an internal or external command/i,
+  // cmd AND PowerShell wordings of "unknown command" — pwsh phrasing was
+  // uncovered, so head/tail/wc gates stored the "Check the spelling" boilerplate
+  // tail instead of the cause line.
+  /is not recognized as (?:an internal or external command|the name of a cmdlet)/i,
   /\b(SyntaxError|TypeError|ReferenceError|AssertionError)\b/,
   /Tests:\s+\d+\s+failed/i,
-  /\bFAIL\s+\S/,
+  // Runner summaries, language-agnostic. Count-bearing forms require a NON-ZERO
+  // count in EITHER order ("1 failed" / "Failed: 1" / "Failures: 1") so a pass
+  // tally ("0 failed", "Failed: 0") never reads as a failure. Covers pytest/
+  // playwright/vitest/jest ("N failed"), RSpec/Elixir/minitest ("N failure(s)"),
+  // dotnet/Maven/sbt/unittest ("Failed: N", "Failures: N", "failures=N").
+  /\b[1-9]\d*\s+fail(?:ed|ures?)\b/i,
+  /\bfail(?:ed|ures?)\s*[:=]\s*[1-9]\d*\b/i,
+  /no tests? (?:found|matched|run|were executed)/i,
+  // Generic error prefix (Playwright "Error: No tests found", Node, tracebacks).
+  /^error:/i,
+  // Compiler/tool error prefixes that carry a bracket before the colon:
+  // Rust "error[E0308]:" and Maven/SBT "[ERROR] ...".
+  /^\s*error\s*\[/i,
+  /^\s*\[ERROR\]/i,
+  // Go: "--- FAIL: TestName", "FAIL\tpkg", standalone "FAIL" (uppercase; pass is
+  // "ok\tpkg"). \b keeps it off "FAILED"/"FAILURE".
+  /\bFAIL\b/,
+  // Build-level status words that never appear in a pass summary: Maven
+  // "BUILD FAILURE", Gradle "BUILD FAILED" / "FAILURE: Build failed", sbt
+  // "*** 1 TEST FAILED ***", dotnet build "Build FAILED.".
+  /\bBUILD\s+(?:FAILURE|FAILED)\b/i,
+  /\bFAILURE\b/i,
+  /\bTESTS?\s+FAILED\b/i,
+  // TAP ("node --test") failure marker.
+  /^not ok\b/i,
   /thread '[^']*' panicked/,
+  /\bpanic:/i,
   /\bFATAL\b/,
 ]
+
+/** Lines that read like a SUCCESS summary. Quoting one as a failure's "last
+ * error" teaches the agent to fix something that worked — the store held
+ * "17 passed (3.1m)" as evidence for a failing gate (MidasAI). Matched as a
+ * SUBSTRING so decorated summaries ("==== 10 passed ====", "ok\tpkg 0.3s",
+ * "BUILD SUCCESSFUL") are caught too — the pass shape need not start the line. */
+const SUCCESS_SHAPED: RegExp[] = [
+  /\b\d+\s+passed\b/i,
+  /\b\d+\s+(?:tests?|specs?|examples?)\s+passed\b/i,
+  /\ball tests passed\b/i,
+  /\bBUILD SUCCESS(?:FUL)?\b/i,
+  /\btest result: ok\b/i,
+  /\bOK\s*\(\s*\d+\s+tests?/i,
+  /^ok\s+\S/i,
+  // dotnet: pass summaries lead with "Passed!" ("Failed!" = failure) or say
+  // "Build succeeded." / "Test Run Successful."
+  /^Passed!/i,
+  /\bBuild succeeded\b/i,
+  /\bTest Run Successful\b/i,
+  /\bno offenses detected\b/i,
+  /\b0 issues\b/i,
+]
+
+export function looksLikeSuccess(line: string): boolean {
+  // A line that reports failures is not a success even when it also tallies
+  // passes ("1 failed, 1780 passed", "Failed: 1"). Non-zero count in either
+  // order, mirroring the failure signatures.
+  if (/\b[1-9]\d*\s+fail(?:ed|ures?)\b/i.test(line)) return false
+  if (/\bfail(?:ed|ures?)\s*[:=]\s*[1-9]\d*\b/i.test(line)) return false
+  return SUCCESS_SHAPED.some((rule) => rule.test(line))
+}
+
+/** Leading decorations runners wrap summaries in ("====", "---", "[info]",
+ * "✔") — stripped before matching so a pattern needs not anticipate every
+ * tool's framing. Bounded so a real line is never eaten whole. */
+const LEADING_DECORATION = /^[\s=\-─—_*#•»>]{0,40}/
+
+export function looksLikeFailure(line: string): boolean {
+  if (line.trim() === "" || looksLikeSuccess(line)) return false
+  const bare = line.replace(LEADING_DECORATION, "")
+  return FAILURE_SIGNATURES.some((rule) => rule.test(line) || rule.test(bare))
+}
 
 export function detectFailure(outputText: string): FailureDetection {
   // PowerShell colors errors with VT sequences — strip before scanning, or
@@ -835,14 +944,24 @@ export function detectFailure(outputText: string): FailureDetection {
 /**
  * For exit-code failures whose output matched no signature, a bare
  * "exit code N" gives a human/agent nothing to write a correction from.
- * Bash output is command output (safe to surface), so keep the last non-empty
- * line — compilers/test runners print their summary at the end.
+ * Bash output is command output (safe to surface). Scan from the END for a
+ * failure-shaped line — compilers/test runners print their summary last, but a
+ * SUCCESS-shaped tail ("17 passed") is never failure evidence: chained commands
+ * and `Select-Object -Last N` pipelines put another shard's pass summary there.
+ * Prefer the last real error line; fall back to the exit code.
  */
 export function failureSnippet(outputText: string, exitCode: number | null): string {
   const lines = stripControl(outputText)
     .split("\n")
     .map((l) => l.trim())
     .filter((l) => l !== "")
+  if (exitCode !== null && exitCode !== 0) {
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i] ?? ""
+      if (looksLikeFailure(line)) return line.slice(0, 200)
+    }
+    return `exit code ${exitCode}`
+  }
   const tail = lines[lines.length - 1]
   if (tail !== undefined && tail !== "") return tail.slice(0, 200)
   return `exit code ${exitCode}`
@@ -854,6 +973,9 @@ export function failureSnippet(outputText: string, exitCode: number | null): str
  * Infrastructure noise, not agent mistakes: aborted/cancelled executions
  * (user hit stop, background task reaped) teach nothing and fragmented the
  * store with unactionable patterns. Aborted != failed.
+ * Boundary: SERVER-side unavailability (daemon down, transport errors, 5xx)
+ * is noise — the agent cannot learn from "the service was down". CLIENT-side
+ * mistakes (4xx, wrong path, syntax) stay teachable and are NOT matched here.
  */
 const NOISE_ERRORS: RegExp[] = [
   /tool execution aborted/i,
@@ -863,6 +985,13 @@ const NOISE_ERRORS: RegExp[] = [
   /\bcanceled by user\b/i,
   /no results found for your query/i, // grep_app empty search: the tool worked, nothing matched
   /user dismissed this question/i, // question tool: the user's choice, not a failure
+  // Infrastructure unavailability: the service, not the command, failed.
+  /lsp (?:server|daemon|process)[^.\n]*(?:unreachable|not running|disconnected|crashed|did not become reachable)/i,
+  /\b(?:daemon|server)\b[^.\n]*(?:unreachable|did not become reachable)/i,
+  /streamable ?http ?error/i, // MCP streamable-http transport failure
+  /\bmcp error\b/i, // MCP transport/protocol errors
+  /non.?2xx status code/i, // webfetch HTTP failure: the endpoint answered, the URL fetch didn't
+  /\btransport error\b/i, // webfetch/gRPC transport failure: the connection itself never completed
 ]
 
 export function isNoiseError(errorText: string): boolean {
@@ -893,7 +1022,24 @@ export function suggestCorrection(signature: string, snippet: string): string {
   if (/\b(npm|yarn|pnpm|bun)\s+(install|ci)\b/i.test(signature)) {
     return "Dependency install failed — inspect the resolver error; try the lockfile/legacy-peer-deps route the repo documents."
   }
-  if (snippet !== "" && snippet !== "exit code 1") {
+  // Unix utilities that do not exist natively in PowerShell — a "not
+  // recognized" failure on one is a platform habit, teach the native form.
+  if (/\b(head|tail|wc|sed|awk|cut|sort|uniq|tr|xargs)\b/i.test(signature) && /not recognized|command not found/i.test(snippet)) {
+    return "This is a Unix command, not available in PowerShell — use the native equivalents: Select-Object -First/-Last for head/tail, (Get-Content <file>).Count for wc -l; or install the tool if you truly need it."
+  }
+  // File-tool probes: not-found means a wrong path guess — locate the file
+  // instead of retrying guessed path variants.
+  if (/^(read|edit|write):/i.test(signature) && /ENOENT|no such file|not found/i.test(snippet)) {
+    return "The file does not exist at that path — locate the real path with glob/grep before reading/editing; do not guess path variants."
+  }
+  // Missing command on this machine — install it or pick an available tool.
+  if (/^bash:/i.test(signature) && /command not found|not recognized/i.test(snippet)) {
+    return "The command is not installed on this machine — install it first, or use an alternative tool that is already available."
+  }
+  // A success-shaped snippet is never an error — quoting it ("Last error:
+  // '17 passed'") teaches the agent to fix something that worked. Likewise a
+  // bare exit code carries nothing to quote. Fall through to the generic text.
+  if (snippet !== "" && !/^exit code \d+$/i.test(snippet) && !looksLikeSuccess(snippet)) {
     return `Last error: "${snippet}" — address that specific error before retrying this exact call.`
   }
   return "This exact call keeps failing — inspect the last output line and change approach before retrying."

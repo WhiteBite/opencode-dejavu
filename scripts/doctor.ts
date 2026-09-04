@@ -42,7 +42,7 @@ if (repair) {
     const project = dir === "" ? null : new GateStore(join(dir, ".opencode", "dejavu"))
     const stores = new Stores(global, project)
     await stores.reconcileAll()
-    await stores.migrate()
+    await stores.migrate(true)
     // Sweep expired gates too, otherwise the report shows gates that should
     // already be gone (reconcile+migrate alone don't expire).
     await stores.expireAll(TTL_DAYS, NOISE_TTL_DAYS)
@@ -97,18 +97,22 @@ interface Scope {
   quarantineFiles: number
   /** keys promoted ≥2 AND resolved (healed/retired-*) ≥2 times — oscillation */
   flappy: Array<{ key: string; promoted: number; resolved: number }>
+  /** version of the process that last SAVED gates.json — durable drift signal */
+  lastInitVersion: string | null
 }
 
 async function loadScope(dir: string, isGlobal: boolean): Promise<Scope> {
   let rawState: Scope["rawState"] = "missing"
   let records: unknown[] = []
+  let lastInitVersion: string | null = null
   try {
     const raw = await readFile(join(dir, "gates.json"), "utf8")
     if (raw.trim() !== "") {
       try {
-        const parsed = JSON.parse(raw) as { gates?: unknown }
+        const parsed = JSON.parse(raw) as { gates?: unknown; lastInitVersion?: unknown }
         rawState = "ok"
         records = Array.isArray(parsed.gates) ? parsed.gates : []
+        if (typeof parsed.lastInitVersion === "string") lastInitVersion = parsed.lastInitVersion
       } catch {
         rawState = "unparseable"
       }
@@ -215,6 +219,7 @@ async function loadScope(dir: string, isGlobal: boolean): Promise<Scope> {
     quarantineBytes,
     quarantineFiles,
     flappy,
+    lastInitVersion,
   }
 }
 
@@ -261,6 +266,17 @@ for (const scope of scopes) {
   if (scope.flappy.length > 0) {
     console.log(`   note: FLAPPY (${scope.flappy.length}) — promoted 2+ AND resolved 2+ times; promote→heal oscillation (data-gathering; damping not yet justified):`)
     for (const f of scope.flappy.slice(0, 10)) console.log(`     - promoted ${f.promoted} | resolved ${f.resolved} | ${keySignature.get(f.key) ?? f.key}`)
+  }
+
+  // FLAPPY escalation: the log-based FLAPPY above rots with rotation, but
+  // promotionCount is lifetime (never reset) — 3+ promotions means the gate
+  // retired and re-promoted at least twice. That is proven oscillation:
+  // report-only (no mechanical auto-demotion) — review, delete, or correct it.
+  const flappyLifetime = gates.filter((g) => (g.promotionCount ?? 0) >= 3)
+  if (flappyLifetime.length > 0) {
+    issues += flappyLifetime.length
+    console.log(`   FLAPPY promotionCount>=3 (${flappyLifetime.length}) — promoted 3+ times over the gate's lifetime (promote→retire→promote oscillation); review, delete, or rewrite the correction:`)
+    for (const g of flappyLifetime.slice(0, 10)) console.log(`     - promoted ${g.promotionCount}x | ${g.signature}`)
   }
 
   const seen = new Set<string>()
@@ -398,32 +414,45 @@ for (const scope of scopes) {
     console.log(`   note: LOCK DEGRADATIONS (${scope.degradedEvents}) — contention exceeded the wait window; updates may have been lost there`)
   }
 
-  try {
-    const raw = await readFile(join(scope.dir, "log.jsonl"), "utf8")
-    const inits = raw.split("\n").filter((l) => l.includes('"type":"init"'))
-    const last = inits[inits.length - 1]
-    let version = "none"
-    if (last) {
-      try {
-        version = (JSON.parse(last) as { version?: string }).version ?? "unknown"
-      } catch {
-        // a corrupt init line must not crash the diagnostic tool itself
-        version = "unknown"
-      }
-    }
-    if (version === "none") {
-      // Indeterminate, not drift: on a busy log the init event rotates away
-      // while a long-lived session keeps running — no init in the kept window
-      // says nothing about which version is writing.
-      console.log("   version indeterminate (no init event in the kept log window)")
-    } else if (version !== PLUGIN_VERSION) {
+  // Version drift: gates.json's lastInitVersion (the version of the process
+  // that last SAVED) is the durable signal — log init events rotate away on a
+  // busy log. Fall back to the last init event for stores not yet saved by a
+  // versioned writer.
+  if (scope.lastInitVersion !== null) {
+    if (scope.lastInitVersion !== PLUGIN_VERSION) {
       issues++
-      console.log(`   VERSION DRIFT: last init in log = ${version}, current = ${PLUGIN_VERSION} — stale plugin sessions were writing here; restart OpenCode`)
+      console.log(`   VERSION DRIFT: last writer = ${scope.lastInitVersion}, current = ${PLUGIN_VERSION} — stale plugin sessions were writing here; restart OpenCode`)
     } else {
-      console.log(`   version ok (${version})`)
+      console.log(`   version ok (${scope.lastInitVersion})`)
     }
-  } catch {
-    console.log("   (no log yet)")
+  } else {
+    try {
+      const raw = await readFile(join(scope.dir, "log.jsonl"), "utf8")
+      const inits = raw.split("\n").filter((l) => l.includes('"type":"init"'))
+      const last = inits[inits.length - 1]
+      let version = "none"
+      if (last) {
+        try {
+          version = (JSON.parse(last) as { version?: string }).version ?? "unknown"
+        } catch {
+          // a corrupt init line must not crash the diagnostic tool itself
+          version = "unknown"
+        }
+      }
+      if (version === "none") {
+        // Indeterminate, not drift: on a busy log the init event rotates away
+        // while a long-lived session keeps running — no init in the kept window
+        // says nothing about which version is writing.
+        console.log("   version indeterminate (no init event in the kept log window)")
+      } else if (version !== PLUGIN_VERSION) {
+        issues++
+        console.log(`   VERSION DRIFT: last init in log = ${version}, current = ${PLUGIN_VERSION} — stale plugin sessions were writing here; restart OpenCode`)
+      } else {
+        console.log(`   version ok (${version})`)
+      }
+    } catch {
+      console.log("   (no log yet)")
+    }
   }
 }
 

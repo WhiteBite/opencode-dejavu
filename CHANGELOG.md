@@ -1,5 +1,50 @@
 # Changelog
 
+## 2.22.0 — 2026-09-04
+
+### Theme
+Root-cause pass over the accumulated store data — 1481 gates across 7 stores analyzed by `analyze`+`doctor`, then reviewed by explore/oracle/kimi3-verifier/Momus. The stores had been faithfully remembering the WRONG things: success lines as errors, infrastructure noise as failures, and whole command families as specific calls. This release fixes evidence quality, the noise boundary, and attribution integrity — what we remember, not just how we remember it.
+
+### Evidence quality (the "17 passed" bug)
+- **`failureSnippet` is error-aware.** For a non-zero exit it now scans from the END for a failure-shaped line instead of blindly keeping the last non-empty line. A success-shaped tail ("17 passed (3.1m)", "1 passed (50.1s)") is never returned as failure evidence; when only success lines remain it falls back to `exit code N`. Chained commands and `Select-Object -Last N` pipelines put another shard's pass summary at the tail — that was teaching gates to "fix" a passing summary.
+- **`looksLikeSuccess` / `looksLikeFailure`** are the shared evidence-quality classifiers. A line that reports failures is never success, even when it also tallies passes ("1 failed, 1780 passed").
+- **`FAILURE_SIGNATURES` gaps closed:** the PowerShell "is not recognized as the name of a cmdlet" wording (only the cmd wording matched, so head/tail/wc gates stored the "Check the spelling" boilerplate), bare runner summaries `[1-9]\d* failed` (pytest/playwright/vitest), `no tests found/matched`, and the generic `^error:` prefix.
+- **Evidence monotonicity:** `recordFailure` never overwrites a failure-shaped snippet with a success-shaped one (latest still wins between two failure-shaped snippets).
+
+### Cross-language generalization (detection is an engine, not a JS/Python list)
+An adversarial cross-ecosystem probe (librarian ground truth for 22 tools + an empirical battery + an independent verifier) showed the v2.22.0 evidence engine was tuned to the JavaScript/Python/PowerShell formats seen in production: Go `--- FAIL:` / `exit status 1`, Maven `[ERROR] BUILD FAILURE`, RSpec/Elixir/minitest `N failure(s)`, dotnet `Failed! - Failed: N` (reversed order), PHPUnit `FAILURES!`, sbt `*** TEST FAILED ***` were all undetected, so their gates degraded to a useless `exit code 1` correction. The fix is language-agnostic, not per-tool enumeration:
+- **Failure vocabulary generalized by shape, not by tool:** count-bearing failure forms now match with a NON-ZERO count in EITHER order (`1 failed` / `Failed: 1` / `Failures: 1` / `failures=N`), covering every runner's summary; build-status words that never appear in a pass summary (`BUILD FAILURE|FAILED`, standalone uppercase `FAIL`, `TEST(S) FAILED`); compiler prefixes that carry a bracket (`error[E0308]:`, `[ERROR]`); Go `exit status N`; TAP `not ok`.
+- **Success invariant is substring-based, not line-start:** decorated/embedded pass summaries (`==== 10 passed ====`, `test result: ok.`, `BUILD SUCCESSFUL`, `OK (N tests)`, Go `ok\tpkg`, dotnet `Passed!`/`Build succeeded.`) are all rejected as evidence. The non-zero-failure guard (`1 failed`, `Failed: 1`) runs first, so a `0 failed` pass tally can never read as a failure — the "17 passed" bug cannot recur in any ecosystem's clothing.
+- **Leading runner decorations** (`====`, `---`, `[info]`) are stripped before matching, so a pattern need not anticipate every tool's framing.
+- Regression battery locks it: 15 ecosystems' failing outputs must yield a real evidence line (never `exit code 1`), and every ecosystem's pass summary must be rejected.
+
+### Correction integrity
+- **`suggestCorrection` never quotes a success-shaped snippet as "Last error"** — it produced `Last error: "17 passed (3.1m)"`. Bare `exit code N` is no longer quoted either.
+- **New correction families:** Unix commands in PowerShell (head/tail/wc → `Select-Object -First/-Last`, `(Get-Content).Count`), file-not-found for read/edit/write (locate via glob, don't guess path variants), and command-not-installed.
+- **`repairGate` heals legacy evidence at the persistence boundary:** clears success-shaped snippets and re-derives a machine `Last error: "…"` template correction that quoted a success line. Human edits never match the fixed template byte-for-byte and are untouched.
+
+### Noise boundary (server-side unavailability is not an agent mistake)
+- **`NOISE_ERRORS` extended:** LSP daemon unreachable, MCP transport / streamable-http errors, webfetch non-2xx, and webfetch/gRPC `transport error` (the connection itself never completed). Client-side mistakes (4xx, ENOENT, syntax) stay teachable.
+- **`isNoiseError` now guards the after-hook too** (it guarded only the event channel), so infra noise grows no gate from either channel.
+- **Retroactive cleanup:** `migrate()` backdates already-classified noise gates to the epoch so the TTL sweep expires them (the accumulated lsp-daemon / webfetch / MCP-noise gates).
+
+### Attribution integrity (the playwright-count-56 bug)
+- **Chain attribution applies only with exactly ONE non-transparent producer.** With several producers the exit code does not say which one failed, so attributing the failure to a known segment fabricated evidence — a diagnostic segment's gate inflated by a non-diagnostic producer's failure. Such chains now record under the whole call. New `nonTransparentProducers` counts the producers (navigation, env assignments, start-sleep, pipe-tail formatters are transparent).
+
+### Immunity holes closed
+- **Env assignments (`$env:CI="true"`, `FOO=bar`) and `start-sleep` are transparent** — they cannot be the failing producer, so they no longer break a diagnostic's exit-1 immunity or attribution.
+- **`npm run check:*` / `verify:*` are diagnostics** — like test/typecheck/lint, their exit 1 is "found issues", not an infrastructure error.
+- **Flag-only wrapper shapes lose residual identity** — `cmd <path> <str> -f` matches a whole command family (a flag is a switch, not call identity) and may only watch.
+
+### Lifecycle & observability
+- **Reminding taught retirement** — a diagnostic gate reminded `TAUGHT_REMINDERS`+1 times with zero same-session reoffense retires softly to `watching` (no `feedbackDemoted`), logged `retired-taught`. The bar is one clean reminder above the blocking threshold so it never preempts anti-nag evidence. `recurredAfterGate` is no signal here (it grows structurally for reminding gates — every session's first failure counts, the note rides after it).
+- **`promotionCount` lifetime counter** — incremented on every promotion, never reset, summed by `mergeGate`, parsed by `coerceGateShape`. Doctor's FLAPPY escalates to an issue at `promotionCount >= 3` (rot-proof oscillation evidence; the log-based FLAPPY rots with rotation). Report-only — no mechanical auto-demotion.
+- **`lastInitVersion` drift signal** — `save()` stamps the WRITER's own version into gates.json on every save; doctor reads it first (log init events rotate away). Fixes the "version indeterminate" blind spot on busy logs.
+- **`migrate(force)` for explicit repair** — `doctor --repair` and `bun scripts/migrate.ts` now force the full per-gate migration regardless of the version stamp. The init-storm skip is a startup optimization; an explicit repair must apply ALL healing, otherwise a same-version re-run of `--repair` silently skips newly added repair logic.
+
+### Data
+- Ran `doctor --repair` across all 7 stores: pruned true-orphan index keys, stamped `lastInitVersion`, expired noise gates (lsp-daemon / webfetch non-2xx / grep-app / transport-error), demoted flag-only / success-evidence gates. Post-repair invariant verified: no enforced gate carries a success-shaped snippet or a garbage template correction.
+
 ## 2.21.0 — 2026-09-03
 
 ### Changed (reminding gates never interrupt — "help, don't nag" completed)

@@ -24,7 +24,7 @@ const targets = projects.length > 0 ? projects : [process.cwd()]
 for (const project of targets) {
   const projectStore = new GateStore(join(project, ".opencode", "dejavu"))
   const stores = new Stores(globalStore, projectStore)
-  await stores.migrate()
+  await stores.migrate(true)
   // The script exits after this — flush deferred demotion events now, or they
   // are silently lost ("every repair is logged" invariant).
   await globalStore.flushDeferred()

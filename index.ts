@@ -9,6 +9,7 @@ import {
   failureSnippet,
   isIntendedNonzero,
   isNoiseError,
+  nonTransparentProducers,
   parameterizeError,
   patternKey,
   sanitizeForStore,
@@ -464,9 +465,14 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
 
         // Attribution: if a segment of the chain matches an already-known
         // pattern, attribute to that segment's key — the chain wrapper changes
-        // every time, the recurring part does not.
+        // every time, the recurring part does not. Defensible ONLY when the
+        // chain has exactly one non-transparent producer: with several, the
+        // exit code does not say which one failed, so attributing the failure
+        // to a single known segment fabricates evidence (a diagnostic segment's
+        // gate inflated by a non-diagnostic producer's failure — the
+        // playwright-count-56 case). Such chains record under the whole call.
         let recordSignature = signature
-        if (input.tool === "bash" && typeof args.command === "string") {
+        if (input.tool === "bash" && typeof args.command === "string" && nonTransparentProducers(args.command) === 1) {
           for (const segSig of bashSegmentSignatures(args.command)) {
             if (await stores.hasKey(patternKey(segSig))) {
               recordSignature = segSig
@@ -494,6 +500,10 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
         if (isCrossChannelDuplicate(patternKey(signature), session, "after")) return
 
         const snippet = sanitizeForStore(detection.matched ? detection.snippet : failureSnippet(text, exitCode))
+
+        // Infrastructure noise (service down, transport errors) is not an agent
+        // mistake — never grow a gate from it, whichever channel it arrives on.
+        if (isNoiseError(snippet) || isNoiseError(text)) return
 
         const result = await stores.recordFailure({
           key,
@@ -585,6 +595,28 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
               changed = true
               escalationLogs.push({ type: "reminded", key: fresh.key, tool: input.tool, session, project: directory, via: "exact" })
               annotation = remindNote(fresh)
+              // Taught retirement (reminding twin of the blocking path): the
+              // note was delivered cleanly TAUGHT_REMINDERS times and NEVER
+              // ignored (zero same-session reoffenses). recurredAfterGate is no
+              // signal here — it grows structurally for reminding gates (every
+              // session's first failure counts, the note rides AFTER it). The
+              // bar is one clean reminder ABOVE the blocking threshold: at the
+              // exact threshold the session may still reoffend (anti-nag's
+              // evidence), so taught yields that round and retires once the
+              // pattern proves itself one more time. Re-promotion on new
+              // failures stays possible (no feedbackDemoted; baseline captured).
+              if (fresh.remindedCount > TAUGHT_REMINDERS && fresh.recurredAfterReminder === 0) {
+                fresh.status = "watching"
+                fresh.retireBaseline = { count: fresh.count }
+                escalationLogs.push({
+                  type: "retired-taught",
+                  key: fresh.key,
+                  tool: fresh.tool,
+                  session,
+                  project: directory,
+                  snippet: `reminded ${fresh.remindedCount}x with zero in-session reoffense — teaching worked, retired to watching`,
+                })
+              }
             } else {
               fresh.recurredAfterReminder += 1
               changed = true

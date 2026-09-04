@@ -1,11 +1,11 @@
 import { existsSync } from "node:fs"
 import { appendFile, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises"
 import { dirname, join } from "node:path"
-import { canBlock, canRemind, fuzzySimilar, FUZZY_MAX_LEN, hasResidualIdentity, isRepoLocal, sanitizeForStore, scrubSecrets, suggestCorrection } from "./patterns"
+import { canBlock, canRemind, fuzzySimilar, FUZZY_MAX_LEN, hasResidualIdentity, isNoiseError, isRepoLocal, looksLikeFailure, sanitizeForStore, scrubSecrets, suggestCorrection } from "./patterns"
 import { coerceGateShape, repairGate } from "./validate"
 
 /** Bumped on behavior changes; stamped into init log events so stale sessions are visible. */
-export const PLUGIN_VERSION = "2.21.0"
+export const PLUGIN_VERSION = "2.22.0"
 
 export interface Gate {
   /** sha1 signature prefix — the pattern identity */
@@ -45,6 +45,10 @@ export interface Gate {
   /** consecutive successes after the gate was enforced — reaching HEAL_SUCCESSES
    * retires the gate to watching (the underlying command got fixed) */
   succeededAfterGate?: number
+  /** lifetime promotions of this pattern — never reset by the lifecycle reset.
+   * The definitive flapping measure (promote→heal→promote oscillation); doctor
+   * escalates FLAPPY with it. Report-only: no mechanical auto-demotion. */
+  promotionCount?: number
   /** count at the moment the gate retired (healed or taught). `count`/`sessions`
    * are lifetime-cumulative, so without damping a retired gate re-promoted on the
    * VERY NEXT single failure (promote→heal→promote oscillation). Re-promotion now
@@ -72,6 +76,12 @@ interface GatesFile {
   /** PLUGIN_VERSION that last ran migrate() on this file — lets subsequent
    * starts skip the full per-gate scan (init storm killer) */
   migrated?: string
+  /** PLUGIN_VERSION of the process that last SAVED this file. Unlike
+   * `migrated` (which converges to the newest version as every reader re-loads
+   * it), this is stamped with the WRITER's own version on every save, so a
+   * stale plugin session writing here leaves its old version behind — the
+   * durable version-drift signal (log init events rotate away). */
+  lastInitVersion?: string
 }
 
 /** Cross-project pattern index: which project dirs have seen each key. */
@@ -500,6 +510,9 @@ export class GateStore {
     await mkdir(ntPath(this.dir), { recursive: true })
     const payload: GatesFile = { version: 1, gates: this.gates }
     if (this.migratedStamp !== null) payload.migrated = this.migratedStamp
+    // The WRITER's own version, stamped on every save — a stale plugin session
+    // leaves its old version here (durable drift signal; log inits rotate away).
+    payload.lastInitVersion = PLUGIN_VERSION
     await atomicWrite(this.gatesPath, `${JSON.stringify(payload, null, 2)}\n`)
     try {
       this.mtimeMs = (await stat(ntPath(this.gatesPath))).mtimeMs
@@ -786,6 +799,9 @@ export function mergeGate(target: Gate, source: Gate): void {
   target.recurredAfterReminder += source.recurredAfterReminder
   target.recurredAfterGate += source.recurredAfterGate
   target.overrideCount += source.overrideCount
+  if (source.promotionCount !== undefined) {
+    target.promotionCount = (target.promotionCount ?? 0) + source.promotionCount
+  }
   if (target.correction === undefined && source.correction !== undefined) target.correction = source.correction
   if (source.review === true) target.review = true
   // A demotion is earned behavior — merging must never launder it away.
@@ -1018,18 +1034,21 @@ export class Stores {
   }
 
   /**
-   * One-time (idempotent) schema/behavior migration:
+   * Idempotent schema/behavior migration:
    *  - probe-tool gates never block (they were learned under the old policy)
    *  - signatures and snippets are secret-scrubbed (cleans historical leaks)
    *  - project copies of already-global keys merge into the global gate
+   * `force` re-runs the full per-gate scan even when the version stamp already
+   * matches — doctor --repair and the migrate script must apply ALL healing
+   * regardless of the stamp; only normal startup uses the init-storm skip.
    */
-  async migrate(): Promise<void> {
+  async migrate(force = false): Promise<void> {
     for (const store of this.scopes()) {
       await store.runLocked(async () => {
         // Init-storm killer: the 2nd..Nth start of the same version skips the
         // full per-gate scan. Policy re-checks still run on every load via
         // repairGate, and new gates are created compliant, so the stamp is safe.
-        if (store.migratedVersion === PLUGIN_VERSION) return
+        if (!force && store.migratedVersion === PLUGIN_VERSION) return
         const gates = await store.load(true)
         let changed = false
         for (const gate of gates) {
@@ -1099,6 +1118,19 @@ export class Stores {
               tool: gate.tool,
               snippet: `feedback demotion (recurred ${gate.recurredAfterGate}, overridden ${gate.overrideCount})`,
             })
+          }
+        }
+        // Retroactive noise cleanup: patterns the current policy classifies as
+        // infrastructure noise (lsp daemon, mcp transport, non-2xx) were
+        // recorded as failures by older versions and bloat the store/index.
+        // Backdate them to the epoch so this init's TTL sweep expires them
+        // (both dates, or repairGate's inverted-date swap would undo it).
+        const epoch = new Date(0).toISOString()
+        for (const gate of gates) {
+          if (isNoiseError(gate.signature) || isNoiseError(gate.snippet)) {
+            gate.firstSeen = epoch
+            gate.lastSeen = epoch
+            changed = true
           }
         }
         // Stamp the migration and persist repairs (save is idempotent when
@@ -1368,7 +1400,13 @@ export class Stores {
       gate.lastSeen = now
       // Only an exact-key failure updates the evidence: a crafted near-duplicate
       // must not overwrite a legitimate gate's snippet via fuzzy consolidation.
-      if (!fuzzyConsolidated) gate.snippet = sanitizeForStore(input.snippet)
+      // Evidence monotonicity: a failure-shaped snippet is never displaced by a
+      // success-shaped one (a pass summary must not push out the real error);
+      // between two failure-shaped snippets the latest wins (freshness).
+      if (!fuzzyConsolidated) {
+        const snippet = sanitizeForStore(input.snippet)
+        if (looksLikeFailure(snippet) || !looksLikeFailure(gate.snippet)) gate.snippet = snippet
+      }
       // A failure breaks any heal streak — the command is still broken.
       gate.succeededAfterGate = 0
 
@@ -1403,6 +1441,7 @@ export class Stores {
         // cleared too: a stale remindedSessions entry from the retiring round
         // would let the session skip its reminder with "one retry allowed".
         if (promoted) {
+          gate.promotionCount = (gate.promotionCount ?? 0) + 1
           gate.remindedCount = 0
           gate.recurredAfterReminder = 0
           gate.recurredAfterGate = 0

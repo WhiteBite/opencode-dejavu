@@ -5,7 +5,7 @@
  * coerceGateShape + repairGate satisfies the data-model invariants.
  */
 import type { Gate } from "./store"
-import { canBlock, canRemind, sanitizeForStore } from "./patterns"
+import { canBlock, canRemind, looksLikeSuccess, sanitizeForStore, suggestCorrection } from "./patterns"
 
 /** sha1 prefix-12, the only key shape patternKey ever emits */
 const KEY_SHAPE = /^[0-9a-f]{12}$/
@@ -15,6 +15,10 @@ const SNIPPET_MAX = 200
 const SESSION_STATE_TTL_MS = 24 * 60 * 60 * 1000
 /** bound per-gate session state so long-lived gates cannot bloat */
 const SESSION_STATE_CAP = 50
+/** The auto-correction template is a FIXED shape — a correction matching it
+ * byte-for-byte around its quoted snippet is machine-generated; anything else
+ * is a human/agent edit and must never be re-derived. */
+const AUTO_TEMPLATE_CORRECTION = /^Last error: "(.*)" — address that specific error before retrying this exact call\.$/
 
 /**
  * Structural parse of one persisted gate object. Returns a well-shaped Gate
@@ -59,6 +63,9 @@ export function coerceGateShape(raw: unknown): Gate | null {
   }
   if (typeof r.succeededAfterGate === "number" && Number.isFinite(r.succeededAfterGate) && r.succeededAfterGate >= 0) {
     gate.succeededAfterGate = Math.floor(r.succeededAfterGate)
+  }
+  if (typeof r.promotionCount === "number" && Number.isFinite(r.promotionCount) && r.promotionCount > 0) {
+    gate.promotionCount = Math.floor(r.promotionCount)
   }
   if (typeof r.correction === "string") gate.correction = r.correction
   if (r.review === true) gate.review = true
@@ -126,6 +133,25 @@ export function repairGate(gate: Gate): boolean {
   if (gate.snippet.length > SNIPPET_MAX) {
     gate.snippet = gate.snippet.slice(0, SNIPPET_MAX)
     changed = true
+  }
+  // A success-shaped snippet is not failure evidence — clear it so the next
+  // failure re-captures a real error line (heals legacy data at the boundary).
+  if (looksLikeSuccess(gate.snippet)) {
+    gate.snippet = ""
+    changed = true
+  }
+  // Machine-generated template corrections quoting a success-shaped line teach
+  // garbage; re-derive from current evidence. Human edits never match the
+  // template byte-for-byte and are untouched.
+  if (gate.correction !== undefined) {
+    const quoted = AUTO_TEMPLATE_CORRECTION.exec(gate.correction)?.[1] ?? ""
+    if (looksLikeSuccess(quoted)) {
+      const rederived = suggestCorrection(gate.signature, gate.snippet)
+      if (rederived !== gate.correction) {
+        gate.correction = rederived
+        changed = true
+      }
+    }
   }
   const signature = sanitizeForStore(gate.signature)
   if (signature !== gate.signature) {
