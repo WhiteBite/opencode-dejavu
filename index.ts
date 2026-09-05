@@ -213,7 +213,7 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
           const proceeded = /#[ \t]*dejavu:proceed\b/.test(command.replace(/"[^"]*"|'[^']*'/g, " "))
           if (!proceeded && shouldWarnLongRunning(command)) {
             throw new GateSignal(
-              `[dejavu] LONG-RUNNING — this looks like a dev server / watcher started in FOREGROUND bash; it will block until the bash timeout and leave an orphan process. Run it detached instead: \`tmux new-session -d\`, \`nohup … &\`, \`Start-Process\`, or a startup script that spawns detached and returns. If you truly need it in foreground, append the trailing comment "# dejavu:proceed".`,
+              `[dejavu] LONG-RUNNING — this looks like a dev server / watcher started in FOREGROUND bash; it will block until the bash timeout and leave an orphan process. Do NOT give up on it — start it DETACHED and continue: PowerShell \`Start-Process npm -ArgumentList 'run','dev'\` (or \`Start-Process powershell -ArgumentList '-File','start-dev.ps1'\`), bash \`nohup npm run dev > server.log 2>&1 &\`, or \`tmux new-session -d\`. For e2e/browser tests: start it detached, poll the port until it answers, run your tests against it, then kill the process. If you truly need it in foreground, append the trailing comment "# dejavu:proceed".`,
             )
           }
         }

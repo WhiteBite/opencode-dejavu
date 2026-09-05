@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.23.3 — 2026-09-05
+
+### Long-running reminder is now actionable (stop agents giving up on e2e)
+A subagent refused browser/e2e verification because starting the dev server seemed impossible (foreground is interrupted by the guard; a `start-dev.ps1` wrapper hangs). The guard was right to interrupt, but its reminder didn't hand the agent a working path, so it gave up instead of switching to detached. The reminder now includes a concrete detached recipe per shell (`Start-Process npm -ArgumentList 'run','dev'`, `Start-Process powershell -ArgumentList '-File','start-dev.ps1'`, `nohup … &`, `tmux new-session -d`) and the e2e workflow (start detached → poll the port → run tests → kill). Note: `.ps1`/`.sh` wrappers are deliberately NOT matched by name — a filename can't tell a detached starter (`start-backend.mjs`) from a foreground one, so name-matching would be a coin flip.
+
 ## 2.23.2 — 2026-09-05
 
 ### False-positive visibility (`doctor` OVERRIDDEN section)
