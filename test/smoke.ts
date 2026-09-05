@@ -2025,6 +2025,7 @@ check("longrun: Start-Process detached does NOT warn", !shouldWarnLongRunning("S
 check("waitloop: while+sleep warns", shouldWarnWaitLoop("while ($true) { Start-Sleep 1 }"))
 check("waitloop: until+curl+sleep warns", shouldWarnWaitLoop("until curl -s http://localhost:3000/health; do sleep 1; done"))
 check("waitloop: plain command does NOT warn", !shouldWarnWaitLoop("curl -s --max-time 5 http://localhost:3000/health"))
+check("waitloop: multi-line PowerShell while+sleep warns", shouldWarnWaitLoop("while ($true) {\n  try { Invoke-WebRequest http://x } catch { Start-Sleep 1 }\n}"))
 
 // before-hook interrupts a foreground server start, honors the escape hatch.
 const lrDir = join(tmp, "longrun-project")

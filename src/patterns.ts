@@ -1101,8 +1101,10 @@ export function shouldWarnLongRunning(command: string): boolean {
  */
 const WAIT_LOOP: RegExp[] = [
   /\b(?:while|until)\b[^\n]*\b(?:sleep|Start-Sleep)\s+\d/i,
-  /\bfor\s*\([^\n]*\)\s*\{[^\n]*\b(?:sleep|Start-Sleep)\s+\d/i,
-  /\bwhile\s*\([^\n]*\b(?:Test-Connection|Invoke-WebRequest|Invoke-RestMethod)\b[^\n]*\)\s*\{/i,
+  // Multi-line loops: infinite condition ($true/true) or a network/health probe,
+  // with a sleep anywhere in the body (possibly on later lines).
+  /\b(?:while|until)\b[^\n]*(?:\$true|\btrue\b|\bTest-Connection\b|\bInvoke-WebRequest\b|\bInvoke-RestMethod\b|\bcurl\b|\bwget\b)[\s\S]{0,500}?\b(?:sleep|Start-Sleep)\b/i,
+  /\bfor\s*\([^\n]*\)\s*\{[\s\S]{0,400}?\b(?:sleep|Start-Sleep)\s+\d/i,
 ]
 
 export function shouldWarnWaitLoop(command: string): boolean {

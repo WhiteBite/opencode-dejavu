@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.24.1 — 2026-09-05
+
+### Readiness-poll hang: port hint + multi-line wait-loop detection
+A subagent started vite detached correctly but vite picked a FREE port (strictPort off) while the readiness poll / playwright waited on the configured port → hang. The long-running reminder now says: read the ACTUAL port from the server's startup log (don't assume the configured port), poll THAT port. Also WAIT-LOOP now catches multi-line PowerShell loops (`while ($true) { … Start-Sleep … }` across lines), which the single-line regexes missed.
+
 ## 2.24.0 — 2026-09-05
 
 ### Close the remaining subagent-hang vectors (deep-research driven)
