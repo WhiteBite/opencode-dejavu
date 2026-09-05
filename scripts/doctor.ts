@@ -346,6 +346,19 @@ for (const scope of scopes) {
     console.log(`   note: FEEDBACK-DEMOTED (${feedbackDemoted.length}) — agent behavior (recurrences/overrides) retired these; re-enforce by setting status back to blocking/reminding AND clearing feedbackDemoted in gates.json`)
   }
 
+  // False-positive votes: every override is the agent explicitly saying "this
+  // gate is wrong / friction, let me through" (dejavu:proceed). A gate that is
+  // STILL enforced while accumulating overrides is a live false positive — the
+  // strongest signal that dejavu is nagging on something that isn't a mistake.
+  const overridden = gates.filter((g) => (g.overrideCount ?? 0) > 0)
+  if (overridden.length > 0) {
+    const live = overridden.filter((g) => g.status !== "watching")
+    if (live.length > 0) issues += live.length
+    console.log(`   OVERRIDDEN (${overridden.length}, of which ${live.length} still enforced) — agent voted these false-positive via dejavu:proceed; still-enforced ones are live friction:`)
+    for (const g of [...overridden].sort((a, b) => (b.overrideCount ?? 0) - (a.overrideCount ?? 0)).slice(0, 10))
+      console.log(`     - override x${g.overrideCount} [${g.status}] ${g.signature}`)
+  }
+
   // Positive signal: correction exists and the pattern never recurred after promotion
   const teaching = gates.filter((g) => g.correction !== undefined && g.recurredAfterGate === 0 && g.count >= 3)
   if (teaching.length > 0) {

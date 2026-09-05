@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.23.2 — 2026-09-05
+
+### False-positive visibility (`doctor` OVERRIDDEN section)
+Every `dejavu:proceed` override is the agent explicitly voting "this gate is wrong / friction." `doctor` now surfaces an **OVERRIDDEN** section listing gates with `overrideCount > 0`, sorted by overrides, and counts how many are **still enforced** (those are live false positives / friction and raise the issue count). Watching ones are history (already feedback-demoted); still-enforced ones (e.g. a `blocking` gradle pipeline the agent keeps overriding) are the actionable false positives. This makes "what is dejavu falsely nagging on?" a one-command answer, alongside the existing STALE-BLOCKING / FEEDBACK-DEMOTED / ANNOYING / NOT-TEACHING sections.
+
 ## 2.23.1 — 2026-09-05
 
 ### Long-running guard hardening (agent-driven combination sweep)
