@@ -45,6 +45,14 @@ An adversarial cross-ecosystem probe (librarian ground truth for 22 tools + an e
 ### Data
 - Ran `doctor --repair` across all 7 stores: pruned true-orphan index keys, stamped `lastInitVersion`, expired noise gates (lsp-daemon / webfetch non-2xx / grep-app / transport-error), demoted flag-only / success-evidence gates. Post-repair invariant verified: no enforced gate carries a success-shaped snippet or a garbage template correction.
 
+## 2.22.1 — 2026-09-05
+
+### Noise boundary — two more infra classes, both non-bash tool errors
+A post-release sweep of the live stores surfaced two more server-side-unavailability patterns that had accumulated as gates (the playwright one at 10x/10 sessions, the LSP one at 10x/6). Both are non-bash tool errors, so they could only ever `watch` — classifying them noise removes clutter with zero teaching lost.
+- **Closed-browser automation errors** (`target page, context or browser has been closed`) — a transient startup/state hiccup fixed by relaunching, not an agent habit.
+- **LSP diagnostics timeouts** (`timed out waiting for fresh diagnostics … within 3000ms`) — the LSP was slow to answer, a latency hiccup, not a mistake.
+- Retroactive: `doctor --repair` expired the accumulated gates (both were non-bash `watching` gates in the global store).
+
 ## 2.21.0 — 2026-09-03
 
 ### Changed (reminding gates never interrupt — "help, don't nag" completed)

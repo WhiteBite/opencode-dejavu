@@ -992,6 +992,13 @@ const NOISE_ERRORS: RegExp[] = [
   /\bmcp error\b/i, // MCP transport/protocol errors
   /non.?2xx status code/i, // webfetch HTTP failure: the endpoint answered, the URL fetch didn't
   /\btransport error\b/i, // webfetch/gRPC transport failure: the connection itself never completed
+  // Browser automation: the page/context/browser was already closed when the
+  // action ran — a transient startup/state hiccup fixed by relaunching, not an
+  // agent habit (and a non-bash tool error could only ever watch anyway).
+  /target page, context or browser has been closed/i,
+  // LSP too slow to answer a diagnostics request in the window — a latency
+  // hiccup, not an agent mistake (and lsp_* tools only ever watch anyway).
+  /timed out waiting for (?:fresh )?diagnostics/i,
 ]
 
 export function isNoiseError(errorText: string): boolean {

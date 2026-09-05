@@ -1861,6 +1861,8 @@ check("isNoiseError classifies lsp daemon unreachable", isNoiseError("LSP daemon
 check("isNoiseError classifies webfetch non-2xx", isNoiseError("StatusCodeError: non 2xx status code (503 get https://example.com)"))
 check("isNoiseError classifies MCP streamable-http transport errors", isNoiseError("StreamableHTTPError: Error posting to endpoint"))
 check("isNoiseError classifies webfetch transport error (connection never completed)", isNoiseError("transport error (get https://example.com)"))
+check("isNoiseError classifies closed-browser automation error (transient state)", isNoiseError("browserbackend.calltool: target page, context or browser has been closed"))
+check("isNoiseError classifies LSP diagnostics timeout (latency hiccup)", isNoiseError("timed out waiting for fresh diagnostics for src/foo.ts within 3000ms."))
 check("isNoiseError does not classify a client-side ENOENT", !isNoiseError("ENOENT: no such file or directory"))
 
 // --- 87g. immunity holes closed: env assignments and start-sleep are
