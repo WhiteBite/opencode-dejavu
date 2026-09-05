@@ -1020,7 +1020,8 @@ export function isNoiseError(errorText: string): boolean {
  */
 const SERVER_STARTERS: RegExp[] = [
   // `start` included: `npm start` is the canonical dev-server script (CRA et al).
-  /\b(npm|yarn|pnpm|bun)\s+(run\s+)?(dev|serve|watch|start)\b/i,
+  // `workspace <name>` covers monorepo `yarn workspace app dev`.
+  /\b(npm|yarn|pnpm|bun)\s+(run\s+|workspace\s+\S+\s+)?(dev|serve|watch|start)\b/i,
   /\b(next|nuxt|astro)\s+dev\b/i,
   /\bng\s+serve\b/i, // Angular
   // `vite` as a command: not in a filename ("vite.config.ts"), not "vitest", not a
@@ -1036,10 +1037,20 @@ const SERVER_STARTERS: RegExp[] = [
   /\bpython\d?(?:\.\d+)?\s+-m\s+http\.server\b/i,
   /\b(python\d?(?:\.\d+)?\s+)?manage\.py\s+runserver\b/i, // Django
   /\bdjango-admin\s+runserver\b/i,
+  // Python scripts named like servers (Flask/FastAPI entrypoints).
+  /\bpython\d?(?:\.\d+)?\s+(?:\S*[\/\\])?(?:app|server|main|run|wsgi|asgi)\.py\b/i,
   /\bphp\s+(-S|artisan\s+serve)\b/i, // built-in / Laravel
   /\bjupyter\s+(lab|notebook)\b/i,
   /\b(webpack-dev-server|webpack\s+serve)\b/i,
   /\b(http-server|live-server)\b/i,
+  // Docker foreground services: `compose up` / `run` WITHOUT -d/--detach block.
+  // `docker run` constrained to server-ish flags (-p/--publish/-it) to avoid
+  // flagging one-shot containers (`docker run --rm alpine echo hi`).
+  /\bdocker(?:-compose)?\s+compose\s+up\b(?![^\n]*\s(?:-d|--detach)\b)/i,
+  /\bdocker\s+run\b(?![^\n]*\s(?:-d|--detach)\b)(?=[^\n]*\s(?:-p|--publish|-it)\b)/i,
+  // Built-in runtime watchers (Node 18+ / Bun): unambiguous long-running.
+  /\bnode\s+--watch\b/i,
+  /\bbun\s+--watch\b/i,
   /\bmvn\b[^\n]*\bspring-boot:run\b/i,
   /\bgradlew?\b[^\n]*\bbootRun\b/i,
   /\bdotnet\s+watch\b/i, // `dotnet run` stays excluded (ambiguous one-shot vs server)
@@ -1056,14 +1067,21 @@ const SERVER_STARTERS: RegExp[] = [
 
 /** Markers that mean the process is already detached / backgrounded. */
 function isDetached(command: string): boolean {
-  if (/\b(nohup|setsid|disown|Start-Process|Start-Job|pm2|forever|daemonize|systemd-run)\b/i.test(command)) return true
+  // Start-Process detaches UNLESS -Wait (blocks for exit) or -NoNewWindow
+  // (runs in the caller's window, effectively foreground).
+  if (/\bStart-Process\b/i.test(command)) return !/\s-(?:Wait|NoNewWindow)\b/i.test(command)
+  // Self-detaching managers/sessions.
+  if (/\b(Start-Job|pm2|forever|daemonize|systemd-run|setsid)\b/i.test(command)) return true
   if (/\btmux\s+(new-session|new)\b/i.test(command)) return true
   // `screen -dmS`/`-d -m` start detached; a bare `screen -S name` is foreground.
   if (/\bscreen\s+-(d|m)/i.test(command)) return true
   if (/\bstart\s+\/b\b/i.test(command)) return true // cmd.exe background
   // A standalone background `&` (not part of `&&`), anywhere — trailing,
   // mid-chain, or closing a subshell (`(cmd &)`). `&&` chains stay foreground.
-  if (/(^|[^&])&([^&]|$)/.test(command.trim())) return true
+  // BUT `& … wait` blocks until the background job finishes, and `nohup X`
+  // without `&` still runs in the foreground — both are NOT detached.
+  if (/(^|[^&])&([^&]|$)/.test(command.trim())) return !/\bwait\b/i.test(command)
+  if (/\b(nohup|disown)\b/i.test(command)) return false // needs `&` to detach; handled above
   return false
 }
 
@@ -1074,6 +1092,21 @@ export function isLongRunningCommand(command: string): boolean {
 /** Warn only for a foreground server start; a detached one is fine. */
 export function shouldWarnLongRunning(command: string): boolean {
   return isLongRunningCommand(command) && !isDetached(command)
+}
+
+/**
+ * Agent-written polling loops with no timeout guard. These are NOT servers —
+ * they hang in a while/until/for loop waiting for a condition (usually a health
+ * endpoint) that may never arrive, until the bash timeout kills them.
+ */
+const WAIT_LOOP: RegExp[] = [
+  /\b(?:while|until)\b[^\n]*\b(?:sleep|Start-Sleep)\s+\d/i,
+  /\bfor\s*\([^\n]*\)\s*\{[^\n]*\b(?:sleep|Start-Sleep)\s+\d/i,
+  /\bwhile\s*\([^\n]*\b(?:Test-Connection|Invoke-WebRequest|Invoke-RestMethod)\b[^\n]*\)\s*\{/i,
+]
+
+export function shouldWarnWaitLoop(command: string): boolean {
+  return WAIT_LOOP.some((rule) => rule.test(command))
 }
 
 // --- Default corrections ------------------------------------------------------

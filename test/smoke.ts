@@ -24,6 +24,7 @@ import {
   looksLikeSuccess,
   nonTransparentProducers,
   shouldWarnLongRunning,
+  shouldWarnWaitLoop,
   normalizeCommand,
   parameterizeError,
   patternKey,
@@ -2011,6 +2012,19 @@ check("longrun: screen -dm detached does NOT warn", !shouldWarnLongRunning("scre
 check("longrun: Start-Job detached does NOT warn", !shouldWarnLongRunning("Start-Job { npm run dev }"))
 check("longrun: subshell & detached does NOT warn", !shouldWarnLongRunning("(npm run dev &) && echo bg-started"))
 check("longrun: && chain still warns", shouldWarnLongRunning("cd repo && npm run dev"))
+// v2.24 hardening: more starters, detached-misfires, wait-loops.
+check("longrun: docker compose up warns", shouldWarnLongRunning("docker compose up"))
+check("longrun: docker compose up -d does NOT warn", !shouldWarnLongRunning("docker compose up -d"))
+check("longrun: node --watch warns", shouldWarnLongRunning("node --watch server.js"))
+check("longrun: yarn workspace dev warns", shouldWarnLongRunning("yarn workspace app dev"))
+check("longrun: python app.py warns", shouldWarnLongRunning("python app.py"))
+check("longrun: & wait is NOT detached (blocks) so warns", shouldWarnLongRunning("npm run dev & wait"))
+check("longrun: nohup without & is NOT detached so warns", shouldWarnLongRunning("nohup npm run dev"))
+check("longrun: Start-Process -Wait is NOT detached so warns", shouldWarnLongRunning("Start-Process 'npm run dev' -Wait"))
+check("longrun: Start-Process detached does NOT warn", !shouldWarnLongRunning("Start-Process 'npm run dev'"))
+check("waitloop: while+sleep warns", shouldWarnWaitLoop("while ($true) { Start-Sleep 1 }"))
+check("waitloop: until+curl+sleep warns", shouldWarnWaitLoop("until curl -s http://localhost:3000/health; do sleep 1; done"))
+check("waitloop: plain command does NOT warn", !shouldWarnWaitLoop("curl -s --max-time 5 http://localhost:3000/health"))
 
 // before-hook interrupts a foreground server start, honors the escape hatch.
 const lrDir = join(tmp, "longrun-project")

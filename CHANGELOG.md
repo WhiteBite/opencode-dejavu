@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.24.0 — 2026-09-05
+
+### Close the remaining subagent-hang vectors (deep-research driven)
+Three research agents (oracle design, librarian on OpenCode bash internals, empirical gap probe) enumerated every way a bash call still hangs. Fixed the high-value, low-false-positive gaps:
+- **More starters**: `docker compose up` / `docker run` (without `-d`, `run` constrained to `-p/-it`), `node --watch`, `bun --watch`, monorepo `yarn workspace <name> dev`, Python server entrypoints (`python app.py|server.py|main.py|wsgi.py|asgi.py`). Ambiguous `go run`/`cargo run`/`dotnet run`/`make` stay excluded by design.
+- **`isDetached` hardened** (these were silently treated as detached but actually block): `& … wait`, `nohup X` without `&`, `Start-Process … -Wait` / `-NoNewWindow`.
+- **New WAIT-LOOP guard**: polling loops (`while/until/for` + `sleep`/`Start-Sleep`, or `while (Test-Connection/Invoke-WebRequest) {`) with no timeout hang until the bash timeout; the reminder now pushes `curl --max-time N` / `-TimeoutSec N` / a max-iteration `break`.
+- **Bypass visibility**: a `dejavu:proceed` bypass of the long-running guard now logs a warning, so "why did my subagent hang" is answerable after the fact.
+- Confirmed from OpenCode source: bash stdin is `ignore` (interactive prompts fail fast on EOF, they don't hang), there is no model-facing background-job or PTY tool, and the 2-min (max 10-min) timeout with SIGTERM→SIGKILL is the only native hang cap — so proactive detection in the plugin is the right layer.
+
 ## 2.23.3 — 2026-09-05
 
 ### Long-running reminder is now actionable (stop agents giving up on e2e)
