@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.23.0 — 2026-09-05
+
+### Long-running command guard (interrupt BEFORE the hang)
+Agents and subagents sometimes start dev servers / watchers in FOREGROUND bash (`npm run dev`, `node server.js`, …). OpenCode's bash tool is one-shot (default 2-min timeout), so the call blocks until timeout, burns tokens, and strands an orphan process; native background-bash was removed from V2 and PTY/tmux are behavior, not enforcement. dejavu now interrupts a foreground server start in the before-hook with a "run detached" reminder (tmux / `nohup … &` / `Start-Process` / a startup script that spawns detached and returns).
+- **Static, bounded class** — unlike open-ended error detection, the set of server starters is small and recognizable (`npm|yarn|pnpm|bun run dev|serve|watch`, `next|nuxt|astro dev`, `vite` (not build), `flask|streamlit run`, `uvicorn|gunicorn`, `python -m http.server`, `mvn spring-boot:run`, `gradle bootRun`, `rails s`, `php -S`), so it warns on first sight rather than learning from an expensive hang.
+- **Detached forms pass silently** — trailing `&`, `nohup`, `setsid`, `disown`, `Start-Process`, `tmux new-session`, `start /b`. One-shots and builds (`vite build`, `npm run build`) are never flagged; ambiguous `node <file>`, `go run`, `dotnet run` are deliberately excluded.
+- **`# dejavu:proceed`** remains the escape hatch for a deliberate foreground run.
+
+## 2.22.1 — 2026-09-05
+
+### Noise boundary — two more infra classes, both non-bash tool errors
+A post-release sweep of the live stores surfaced two more server-side-unavailability patterns that had accumulated as gates (the playwright one at 10x/10 sessions, the LSP one at 10x/6). Both are non-bash tool errors, so they could only ever `watch` — classifying them noise removes clutter with zero teaching lost.
+- **Closed-browser automation errors** (`target page, context or browser has been closed`) — a transient startup/state hiccup fixed by relaunching, not an agent habit.
+- **LSP diagnostics timeouts** (`timed out waiting for fresh diagnostics … within 3000ms`) — the LSP was slow to answer, a latency hiccup, not a mistake.
+- Retroactive: `doctor --repair` expired the accumulated gates (both were non-bash `watching` gates in the global store).
+
 ## 2.22.0 — 2026-09-04
 
 ### Theme
@@ -44,14 +60,6 @@ An adversarial cross-ecosystem probe (librarian ground truth for 22 tools + an e
 
 ### Data
 - Ran `doctor --repair` across all 7 stores: pruned true-orphan index keys, stamped `lastInitVersion`, expired noise gates (lsp-daemon / webfetch non-2xx / grep-app / transport-error), demoted flag-only / success-evidence gates. Post-repair invariant verified: no enforced gate carries a success-shaped snippet or a garbage template correction.
-
-## 2.22.1 — 2026-09-05
-
-### Noise boundary — two more infra classes, both non-bash tool errors
-A post-release sweep of the live stores surfaced two more server-side-unavailability patterns that had accumulated as gates (the playwright one at 10x/10 sessions, the LSP one at 10x/6). Both are non-bash tool errors, so they could only ever `watch` — classifying them noise removes clutter with zero teaching lost.
-- **Closed-browser automation errors** (`target page, context or browser has been closed`) — a transient startup/state hiccup fixed by relaunching, not an agent habit.
-- **LSP diagnostics timeouts** (`timed out waiting for fresh diagnostics … within 3000ms`) — the LSP was slow to answer, a latency hiccup, not a mistake.
-- Retroactive: `doctor --repair` expired the accumulated gates (both were non-bash `watching` gates in the global store).
 
 ## 2.21.0 — 2026-09-03
 

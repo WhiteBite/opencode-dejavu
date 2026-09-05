@@ -23,6 +23,7 @@ import {
   looksLikeFailure,
   looksLikeSuccess,
   nonTransparentProducers,
+  shouldWarnLongRunning,
   normalizeCommand,
   parameterizeError,
   patternKey,
@@ -1971,6 +1972,39 @@ check(
   "xlang pass-summary tail of a failing run is skipped for the real error",
   failureSnippet("error: real cause\n17 passed (3.1m)", 1) === "error: real cause",
 )
+
+// --- 89. long-running command guard. Foreground dev-server starts must warn;
+// detached / one-shot / build commands must NOT. ---
+check("longrun: npm run dev warns", shouldWarnLongRunning("npm run dev"))
+check("longrun: next dev warns", shouldWarnLongRunning("next dev"))
+check("longrun: python -m http.server warns", shouldWarnLongRunning("python -m http.server"))
+check("longrun: vite (no build) warns", shouldWarnLongRunning("vite"))
+check("longrun: vite build does NOT warn", !shouldWarnLongRunning("vite build"))
+check("longrun: npm run build does NOT warn", !shouldWarnLongRunning("npm run build"))
+check("longrun: trailing & does NOT warn", !shouldWarnLongRunning("npm run dev &"))
+check("longrun: nohup does NOT warn", !shouldWarnLongRunning("nohup npm run dev &"))
+check("longrun: tmux does NOT warn", !shouldWarnLongRunning("tmux new-session -d -s app 'npm run dev'"))
+check("longrun: node one-shot does NOT warn", !shouldWarnLongRunning("node scripts/build.js"))
+
+// before-hook interrupts a foreground server start, honors the escape hatch.
+const lrDir = join(tmp, "longrun-project")
+const hooksLR = await Dejavu({ directory: lrDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+const lrAttempt = async (command: string): Promise<Error | null> => {
+  try {
+    await (hooksLR["tool.execute.before"] as BeforeHook)(
+      { tool: "bash", sessionID: "lr1", callID: "lr-c1" } as unknown as BeforeInput,
+      { args: { command } } as unknown as BeforeOutput,
+    )
+    return null
+  } catch (error) {
+    return error as Error
+  }
+}
+const lrBlocked = await lrAttempt("npm run dev")
+check("longrun: before-hook interrupts foreground server with LONG-RUNNING note", lrBlocked !== null && lrBlocked.message.includes("LONG-RUNNING"))
+check("longrun: dejavu:proceed bypasses the guard", (await lrAttempt("npm run dev # dejavu:proceed")) === null)
+check("longrun: detached server is not interrupted", (await lrAttempt("npm run dev &")) === null)
+check("longrun: one-shot command is not interrupted", (await lrAttempt("npm run build")) === null)
 
 // --- 86. round-8 invariant: a corrupt GLOBAL gates.json is quarantined under the
 // gates lock by reconcile(); the unlocked routing peeks in reconcileAll (escalation

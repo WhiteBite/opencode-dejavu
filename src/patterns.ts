@@ -1005,6 +1005,48 @@ export function isNoiseError(errorText: string): boolean {
   return NOISE_ERRORS.some((rule) => rule.test(errorText))
 }
 
+// --- Long-running command guard ------------------------------------------------
+
+/**
+ * High-confidence dev-server / watcher starters. Running one in FOREGROUND bash
+ * blocks the tool call until its timeout (~2 min) and strands an orphan process.
+ * Deliberately conservative: only unambiguous starters are listed (ambiguous
+ * `node <file>`, `go run`, `dotnet run` are NOT here — they may be one-shots).
+ * This is a bounded, recognizable class, unlike open-ended error detection.
+ */
+const SERVER_STARTERS: RegExp[] = [
+  /\b(npm|yarn|pnpm|bun)\s+run\s+(dev|serve|watch)\b/i,
+  /\b(npm|yarn|pnpm|bun)\s+dev\b/i,
+  /\b(next|nuxt|astro)\s+dev\b/i,
+  /\bvite\b(?![^\n]*\bbuild\b)/i,
+  /\b(flask|streamlit)\s+run\b/i,
+  /\b(uvicorn|gunicorn)\b/i,
+  /\bpython\d?(?:\.\d+)?\s+-m\s+http\.server\b/i,
+  /\bmvn\b[^\n]*\bspring-boot:run\b/i,
+  /\bgradlew?\b[^\n]*\bbootRun\b/i,
+  /\brails\s+(s|server)\b/i,
+  /\bphp\s+-S\b/i,
+]
+
+/** Markers that mean the process is already detached / backgrounded. */
+function isDetached(command: string): boolean {
+  if (/\b(nohup|setsid|disown|Start-Process)\b/i.test(command)) return true
+  if (/\btmux\s+(new-session|new)\b/i.test(command)) return true
+  if (/\bstart\s+\/b\b/i.test(command)) return true // cmd.exe background
+  // A trailing background `&` that is not part of `&&`.
+  if (/[^&]&\s*$/.test(command.trim())) return true
+  return false
+}
+
+export function isLongRunningCommand(command: string): boolean {
+  return SERVER_STARTERS.some((rule) => rule.test(command))
+}
+
+/** Warn only for a foreground server start; a detached one is fine. */
+export function shouldWarnLongRunning(command: string): boolean {
+  return isLongRunningCommand(command) && !isDetached(command)
+}
+
 // --- Default corrections ------------------------------------------------------
 
 /**

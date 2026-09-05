@@ -14,6 +14,7 @@ import {
   patternKey,
   sanitizeForStore,
   scrubSecrets,
+  shouldWarnLongRunning,
 } from "./src/patterns"
 import { checkFeedbackDemotion, GateStore, GLOBAL_PROJECTS, MAX_SESSIONS, NOISE_TTL_DAYS, Stores, TTL_DAYS, type Gate, type LogEvent, PLUGIN_VERSION } from "./src/store"
 
@@ -200,6 +201,22 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
         const args = scrubbedArgs(rawArgs)
         const signature = callSignature(input.tool, args)
         if (!signature) return
+
+        // Proactive long-running guard: a FOREGROUND dev-server/watcher start
+        // would block this bash call until its timeout (~2 min) and strand an
+        // orphan process. Interrupt BEFORE the hang with a "run detached"
+        // reminder. Unlike learned gates this is a static, bounded class
+        // (server starters), so it warns on first sight. The dejavu:proceed
+        // escape hatch still allows a deliberate foreground run.
+        if (input.tool === "bash" && typeof rawArgs.command === "string") {
+          const command = rawArgs.command
+          const proceeded = /#[ \t]*dejavu:proceed\b/.test(command.replace(/"[^"]*"|'[^']*'/g, " "))
+          if (!proceeded && shouldWarnLongRunning(command)) {
+            throw new GateSignal(
+              `[dejavu] LONG-RUNNING — this looks like a dev server / watcher started in FOREGROUND bash; it will block until the bash timeout and leave an orphan process. Run it detached instead: \`tmux new-session -d\`, \`nohup … &\`, \`Start-Process\`, or a startup script that spawns detached and returns. If you truly need it in foreground, append the trailing comment "# dejavu:proceed".`,
+            )
+          }
+        }
 
         // Chain-bypass protection: a gate on "rm -rf /" must also fire when the
         // command hides inside "git status && rm -rf /".
