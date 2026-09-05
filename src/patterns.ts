@@ -215,6 +215,10 @@ export function parameterizeError(text: string): string {
 const DIAGNOSTIC_VERBS: RegExp[] = [
   /(^|[\s|;&:])(grep|rg|findstr|select-string)\b/i,
   /\bgit grep\b/i,
+  // Read-only git inspectors are diagnostics like `git grep`: their exit 1 is
+  // usually a downstream filter finding nothing (`git show … | Select-String`),
+  // not a mistake. Real git errors exit >= 2 and still count.
+  /\bgit\s+(show|log|ls-tree|ls-files|blame|diff)\b/i,
   /(^|[\s|;&:])diff\b/i,
   /\b(pytest|jest|vitest|mocha|cucumbertest)\b/i,
   // npm/yarn/pnpm test / typecheck / lint scripts are iteration work — their
@@ -1015,26 +1019,51 @@ export function isNoiseError(errorText: string): boolean {
  * This is a bounded, recognizable class, unlike open-ended error detection.
  */
 const SERVER_STARTERS: RegExp[] = [
-  /\b(npm|yarn|pnpm|bun)\s+run\s+(dev|serve|watch)\b/i,
-  /\b(npm|yarn|pnpm|bun)\s+dev\b/i,
+  // `start` included: `npm start` is the canonical dev-server script (CRA et al).
+  /\b(npm|yarn|pnpm|bun)\s+(run\s+)?(dev|serve|watch|start)\b/i,
   /\b(next|nuxt|astro)\s+dev\b/i,
-  /\bvite\b(?![^\n]*\bbuild\b)/i,
-  /\b(flask|streamlit)\s+run\b/i,
-  /\b(uvicorn|gunicorn)\b/i,
+  /\bng\s+serve\b/i, // Angular
+  // `vite` as a command: not in a filename ("vite.config.ts"), not "vitest", not a
+  // `build:` script target ("npm run build:vite"), and not followed by a bare
+  // `build` (one-shot). `vite build --watch` is a watcher (separate rule).
+  /(?<![:\w])vite\b(?![.\w])(?![^\n]*\bbuild\b)/i,
+  /\bvite\s+build\b[^\n]*\bwatch\b/i,
+  // Flask 2.3+ puts `--app X` between the binary and `run`.
+  /\b(flask|streamlit)\b[^\n|;&]*\brun\b/i,
+  // Require an arg (module:var or flag) so `pip install uvicorn gunicorn` and
+  // `grep uvicorn` (mention/install) don't read as starting a server.
+  /\b(uvicorn|gunicorn)\s+(?:--?\w[^\s]*|\S+:\S+)/i,
   /\bpython\d?(?:\.\d+)?\s+-m\s+http\.server\b/i,
+  /\b(python\d?(?:\.\d+)?\s+)?manage\.py\s+runserver\b/i, // Django
+  /\bdjango-admin\s+runserver\b/i,
+  /\bphp\s+(-S|artisan\s+serve)\b/i, // built-in / Laravel
+  /\bjupyter\s+(lab|notebook)\b/i,
+  /\b(webpack-dev-server|webpack\s+serve)\b/i,
+  /\b(http-server|live-server)\b/i,
   /\bmvn\b[^\n]*\bspring-boot:run\b/i,
   /\bgradlew?\b[^\n]*\bbootRun\b/i,
+  /\bdotnet\s+watch\b/i, // `dotnet run` stays excluded (ambiguous one-shot vs server)
   /\brails\s+(s|server)\b/i,
-  /\bphp\s+-S\b/i,
+  /\bhugo\s+server\b/i,
+  /\bjekyll\s+serve\b/i,
+  /\bmkdocs\s+serve\b/i,
+  /\bmix\s+phx\.server\b/i, // Elixir/Phoenix
+  /\biex\s+-S\s+mix\b/i,
+  /\bnodemon\b/i,
+  /\b(expo|react-native)\s+start\b/i,
+  /\bollama\s+serve\b/i,
 ]
 
 /** Markers that mean the process is already detached / backgrounded. */
 function isDetached(command: string): boolean {
-  if (/\b(nohup|setsid|disown|Start-Process)\b/i.test(command)) return true
+  if (/\b(nohup|setsid|disown|Start-Process|Start-Job|pm2|forever|daemonize|systemd-run)\b/i.test(command)) return true
   if (/\btmux\s+(new-session|new)\b/i.test(command)) return true
+  // `screen -dmS`/`-d -m` start detached; a bare `screen -S name` is foreground.
+  if (/\bscreen\s+-(d|m)/i.test(command)) return true
   if (/\bstart\s+\/b\b/i.test(command)) return true // cmd.exe background
-  // A trailing background `&` that is not part of `&&`.
-  if (/[^&]&\s*$/.test(command.trim())) return true
+  // A standalone background `&` (not part of `&&`), anywhere — trailing,
+  // mid-chain, or closing a subshell (`(cmd &)`). `&&` chains stay foreground.
+  if (/(^|[^&])&([^&]|$)/.test(command.trim())) return true
   return false
 }
 

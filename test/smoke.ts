@@ -1348,6 +1348,12 @@ check("(deploy && grep) still splits — non-diagnostic not hidden", !isIntended
 check("npm run typecheck is a diagnostic", isIntendedNonzero("npm run typecheck 2>&1", 1))
 check("npm run lint is a diagnostic", isIntendedNonzero("npm run lint 2>&1 | Select-Object -Last 3", 1))
 check("pnpm --filter typecheck is a diagnostic", isIntendedNonzero("pnpm --filter @midasai/midas-ui typecheck 2>&1 | Select-Object -Last 5", 1))
+// Read-only git inspectors: exit 1 is a downstream filter finding nothing
+// (`git show … | Select-String` no-match), not a mistake (the Muffin case).
+check("git show piped to Select-String keeps immunity", isIntendedNonzero("git show head:file.cs | Select-String -Pattern x", 1))
+check("git show --stat piped to head keeps immunity", isIntendedNonzero("git show --stat abc123 | head - 5", 1))
+check("git log piped to Select-String keeps immunity", isIntendedNonzero("git log --oneline -5 | Select-String -Pattern fix", 1))
+check("git show with real error (exit 2) still counts", !isIntendedNonzero("git show badref", 2))
 check("npm run build is NOT a diagnostic (real failure)", !isIntendedNonzero("npm run build 2>&1", 1))
 
 // --- 65. taught retirement: clean reminders retire the gate softly ---
@@ -1985,6 +1991,26 @@ check("longrun: trailing & does NOT warn", !shouldWarnLongRunning("npm run dev &
 check("longrun: nohup does NOT warn", !shouldWarnLongRunning("nohup npm run dev &"))
 check("longrun: tmux does NOT warn", !shouldWarnLongRunning("tmux new-session -d -s app 'npm run dev'"))
 check("longrun: node one-shot does NOT warn", !shouldWarnLongRunning("node scripts/build.js"))
+// Canonical starters across ecosystems (hardening pass).
+check("longrun: npm start warns", shouldWarnLongRunning("npm start"))
+check("longrun: ng serve warns", shouldWarnLongRunning("ng serve"))
+check("longrun: django runserver warns", shouldWarnLongRunning("python manage.py runserver"))
+check("longrun: php artisan serve warns", shouldWarnLongRunning("php artisan serve"))
+check("longrun: jupyter lab warns", shouldWarnLongRunning("jupyter lab"))
+check("longrun: webpack serve warns", shouldWarnLongRunning("webpack serve"))
+check("longrun: dotnet watch warns", shouldWarnLongRunning("dotnet watch"))
+check("longrun: hugo server warns", shouldWarnLongRunning("hugo server"))
+check("longrun: mix phx.server warns", shouldWarnLongRunning("mix phx.server"))
+check("longrun: nodemon warns", shouldWarnLongRunning("nodemon server.js"))
+// False-positive hardening: installs/mentions/filenames must NOT warn.
+check("longrun: pip install uvicorn does NOT warn", !shouldWarnLongRunning("pip install uvicorn gunicorn fastapi"))
+check("longrun: cat vite.config.ts does NOT warn", !shouldWarnLongRunning("cat vite.config.ts"))
+check("longrun: npm run build:vite does NOT warn", !shouldWarnLongRunning("npm run build:vite"))
+check("longrun: vite build --watch warns", shouldWarnLongRunning("vite build --watch"))
+check("longrun: screen -dm detached does NOT warn", !shouldWarnLongRunning("screen -dmS app npm run dev"))
+check("longrun: Start-Job detached does NOT warn", !shouldWarnLongRunning("Start-Job { npm run dev }"))
+check("longrun: subshell & detached does NOT warn", !shouldWarnLongRunning("(npm run dev &) && echo bg-started"))
+check("longrun: && chain still warns", shouldWarnLongRunning("cd repo && npm run dev"))
 
 // before-hook interrupts a foreground server start, honors the escape hatch.
 const lrDir = join(tmp, "longrun-project")

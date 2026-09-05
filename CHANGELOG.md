@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.23.1 — 2026-09-05
+
+### Long-running guard hardening (agent-driven combination sweep)
+Two agents (a librarian survey of real starter/detach idioms across ecosystems + an empirical probe over ~60 command combinations) stress-tested the 2.23.0 guard and surfaced 14 false positives and 16 false negatives. Fixed the high-value, low-risk ones:
+- **Starters added** (canonical, unambiguous): `npm|yarn|pnpm|bun start`, `ng serve`, `manage.py runserver` / `django-admin runserver`, `php artisan serve`, `jupyter lab|notebook`, `webpack serve|webpack-dev-server`, `http-server|live-server`, `dotnet watch`, `hugo server`, `jekyll serve`, `mkdocs serve`, `mix phx.server`, `iex -S mix`, `nodemon`, `expo|react-native start`, `ollama serve`.
+- **False positives fixed**: `pip install uvicorn gunicorn` no longer reads as starting a server (uvicorn/gunicorn now require a module:var or flag arg); `cat vite.config.ts` / `npm run build:vite` no longer match `vite` as a filename/`build:` target; `vite build --watch` now warns (watcher).
+- **Detach detection broadened**: `screen -dm`, `pm2`, `Start-Job`, `forever`, `daemonize`, `systemd-run`, and a standalone `&` anywhere (trailing, mid-chain, or closing a subshell) — while `&&` chains still warn.
+- **Read-only git inspectors are diagnostics** (`git show|log|ls-tree|ls-files|blame|diff`): a live subagent was interrupted by a blocking gate on `git show … | Select-String`, whose exit 1 is just the downstream filter finding nothing. These now promote to `reminding` at most; real git errors exit ≥ 2 and still count. Existing blocking `git show | …` gates were demoted by `doctor --repair`.
+- Known limitations remain by design: ambiguous `node <file>`, `go run`, `dotnet run` are not flagged; mention-vs-execution (`grep 'npm run dev' Makefile`) can still warn — `# dejavu:proceed` escapes.
+
 ## 2.23.0 — 2026-09-05
 
 ### Long-running command guard (interrupt BEFORE the hang)
