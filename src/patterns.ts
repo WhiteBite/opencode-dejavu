@@ -1038,7 +1038,9 @@ const SERVER_STARTERS: RegExp[] = [
   /\b(python\d?(?:\.\d+)?\s+)?manage\.py\s+runserver\b/i, // Django
   /\bdjango-admin\s+runserver\b/i,
   // Python scripts named like servers (Flask/FastAPI entrypoints).
-  /\bpython\d?(?:\.\d+)?\s+(?:\S*[\/\\])?(?:app|server|main|run|wsgi|asgi)\.py\b/i,
+  // Negative lookahead for `\s+cli\b`: `python …/server.py cli …` is a one-shot
+  // CLI invocation (e.g. muffin-supervisor), not a foreground server start.
+  /\bpython\d?(?:\.\d+)?\s+(?:\S*[\/\\])?(?:app|server|main|run|wsgi|asgi)\.py\b(?!\s+cli\b)/i,
   /\bphp\s+(-S|artisan\s+serve)\b/i, // built-in / Laravel
   /\bjupyter\s+(lab|notebook)\b/i,
   /\b(webpack-dev-server|webpack\s+serve)\b/i,

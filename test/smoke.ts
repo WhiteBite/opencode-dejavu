@@ -1990,6 +1990,14 @@ check("longrun: vite build does NOT warn", !shouldWarnLongRunning("vite build"))
 check("longrun: npm run build does NOT warn", !shouldWarnLongRunning("npm run build"))
 check("longrun: trailing & does NOT warn", !shouldWarnLongRunning("npm run dev &"))
 check("longrun: nohup does NOT warn", !shouldWarnLongRunning("nohup npm run dev &"))
+check(
+  "longrun: python server.py cli one-shot does NOT warn",
+  !shouldWarnLongRunning("python tools/muffin-supervisor/server.py cli start parity-board"),
+)
+check(
+  "longrun: bare python server.py still warns",
+  shouldWarnLongRunning("python tools/muffin-supervisor/server.py"),
+)
 check("longrun: tmux does NOT warn", !shouldWarnLongRunning("tmux new-session -d -s app 'npm run dev'"))
 check("longrun: node one-shot does NOT warn", !shouldWarnLongRunning("node scripts/build.js"))
 // Canonical starters across ecosystems (hardening pass).
@@ -2018,6 +2026,11 @@ check("longrun: docker compose up -d does NOT warn", !shouldWarnLongRunning("doc
 check("longrun: node --watch warns", shouldWarnLongRunning("node --watch server.js"))
 check("longrun: yarn workspace dev warns", shouldWarnLongRunning("yarn workspace app dev"))
 check("longrun: python app.py warns", shouldWarnLongRunning("python app.py"))
+// server.py with `cli` subcommand is a one-shot CLI invocation, not a foreground server.
+check("longrun: python server.py (bare) warns", shouldWarnLongRunning("python tools/muffin-supervisor/server.py"))
+check("longrun: python server.py cli does NOT warn", !shouldWarnLongRunning("python tools/muffin-supervisor/server.py cli overview"))
+check("longrun: python server.py cli (bare) does NOT warn", !shouldWarnLongRunning("python server.py cli"))
+check("longrun: python server.py with non-cli args still warns", shouldWarnLongRunning("python server.py --port 8099"))
 check("longrun: & wait is NOT detached (blocks) so warns", shouldWarnLongRunning("npm run dev & wait"))
 check("longrun: nohup without & is NOT detached so warns", shouldWarnLongRunning("nohup npm run dev"))
 check("longrun: Start-Process -Wait is NOT detached so warns", shouldWarnLongRunning("Start-Process 'npm run dev' -Wait"))
