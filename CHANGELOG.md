@@ -1,5 +1,10 @@
 # Changelog
 
+## 2.26.1 — 2026-09-08
+
+### Fixed (snippet evidence for bare-exit failures)
+`failureSnippet` no longer falls straight to a bare `exit code N` when a failed command's output has no failure-shaped line: it now returns the last NON-success line (a success-shaped tail is still never surfaced). Gates on gradle/flutter/etc. that previously taught nothing now carry real context. Existing bare-exit gates pick up the better snippet on their next recurrence.
+
 ## 2.26.0 — 2026-09-08
 
 ### Fixed (correction quality — what dejavu actually tells agents)

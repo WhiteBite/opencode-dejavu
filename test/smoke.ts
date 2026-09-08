@@ -2127,6 +2127,8 @@ check("looksLikeSuccess rejects the node version banner", looksLikeSuccess("Node
 const corrGate = seedGate({ key: patternKey("bash:git show --stat <hash> | head - <n>"), signature: "bash:git show --stat <hash> | head - <n>", status: "reminding", snippet: "Check the spelling of the name, or if a path was included", correction: `Last error: "Check the spelling of the name, or if a path was included" — address that specific error before retrying this exact call.` }) as unknown as Gate
 const corrChanged = repairGate(corrGate)
 check("repairGate upgrades a stale 'Check the spelling' AUTO_TEMPLATE to Unix advice", corrChanged === true && corrGate.correction?.includes("Unix tool") === true)
+check("failureSnippet falls back to the last non-success line, not a bare exit code", failureSnippet("Loading project\nConfiguration cache entry stored.", 1) === "Loading project")
+check("failureSnippet still never surfaces a success-only tail", failureSnippet("17 passed\nall tests passed", 1) === "exit code 1")
 
 // --- 86. round-8 invariant: a corrupt GLOBAL gates.json is quarantined under the
 // gates lock by reconcile(); the unlocked routing peeks in reconcileAll (escalation

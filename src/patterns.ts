@@ -957,7 +957,7 @@ export function detectFailure(outputText: string): FailureDetection {
  * failure-shaped line — compilers/test runners print their summary last, but a
  * SUCCESS-shaped tail ("17 passed") is never failure evidence: chained commands
  * and `Select-Object -Last N` pipelines put another shard's pass summary there.
- * Prefer the last real error line; fall back to the exit code.
+ * Prefer the last real error line, then the last non-success line, then the exit code.
  */
 export function failureSnippet(outputText: string, exitCode: number | null): string {
   const lines = stripControl(outputText)
@@ -968,6 +968,11 @@ export function failureSnippet(outputText: string, exitCode: number | null): str
     for (let i = lines.length - 1; i >= 0; i--) {
       const line = lines[i] ?? ""
       if (looksLikeFailure(line)) return line.slice(0, 200)
+    }
+    // No failure-shaped line: the last non-success line beats a bare exit code.
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i] ?? ""
+      if (!looksLikeSuccess(line)) return line.slice(0, 200)
     }
     return `exit code ${exitCode}`
   }
