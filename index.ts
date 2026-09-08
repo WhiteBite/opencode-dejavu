@@ -165,6 +165,13 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
     await stores.expireAll(TTL_DAYS, NOISE_TTL_DAYS)
     await stores.rotateLogs()
     await stores.logAll({ type: "init", key: "dejavu", version: PLUGIN_VERSION })
+    // Surface non-automatable gate health (NOT TEACHING / review) to the durable log instead of letting it accumulate silently.
+    const enforced = await stores.enforcedGates()
+    const notTeaching = enforced.filter((g) => g.recurredAfterGate >= 3).length
+    const review = enforced.filter((g) => g.review === true).length
+    if (notTeaching > 0 || review > 0) {
+      await stores.logAll({ type: "health", key: "dejavu", snippet: `not-teaching ${notTeaching}, review ${review}` })
+    }
     await logClient("info", `dejavu initialized v${PLUGIN_VERSION}`)
   } catch (error) {
     // init failures must not prevent hook registration — but must be visible,

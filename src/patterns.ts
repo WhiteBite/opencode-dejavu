@@ -218,7 +218,7 @@ const DIAGNOSTIC_VERBS: RegExp[] = [
   // Read-only git inspectors are diagnostics like `git grep`: their exit 1 is
   // usually a downstream filter finding nothing (`git show … | Select-String`),
   // not a mistake. Real git errors exit >= 2 and still count.
-  /\bgit\s+(show|log|ls-tree|ls-files|blame|diff)\b/i,
+  /\bgit\s+(show|log|status|ls-tree|ls-files|blame|diff)\b/i,
   /(^|[\s|;&:])diff\b/i,
   /\b(pytest|jest|vitest|mocha|cucumbertest)\b/i,
   // npm/yarn/pnpm test / typecheck / lint scripts are iteration work — their

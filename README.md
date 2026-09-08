@@ -121,7 +121,7 @@ bun run typecheck        # tsc --noEmit (index.ts, src/**, scripts/**, test/**)
 bun test/smoke.ts        # behavioral smoke test, no framework needed
 ```
 
-Tunables are named constants at the top of `index.ts` and `src/store.ts`: `PROMOTE_COUNT` (3), `PROMOTE_COUNT_PROBE` (5), `PROMOTE_SESSIONS` (2), `GLOBAL_PROJECTS` (2), `TTL_DAYS` (60), `NOISE_TTL_DAYS` (7), `REVIEW_FIRES` (10), `MAX_GATES` (2000), `HEAL_SUCCESSES` (3), `DEMOTE_RECURRENCES` (3), `DEMOTE_REOFFENSE_SESSIONS` (2), `DEMOTE_OVERRIDES` (5), `TAUGHT_REMINDERS` (5).
+Tunables are named constants at the top of `index.ts` and `src/store.ts`: `PROMOTE_COUNT` (3), `PROMOTE_COUNT_PROBE` (5), `PROMOTE_SESSIONS` (2), `GLOBAL_PROJECTS` (2), `TTL_DAYS` (60), `NOISE_TTL_DAYS` (7), `REVIEW_FIRES` (10), `MAX_GATES` (2000), `HEAL_SUCCESSES` (3), `DEMOTE_RECURRENCES` (3), `DEMOTE_REOFFENSE_SESSIONS` (2), `DEMOTE_OVERRIDES` (3), `TAUGHT_REMINDERS` (5), `ORPHAN_CANDIDATE_DAYS` (7).
 
 ## Roadmap
 

@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.25.0 — 2026-09-08
+
+### Added (self-maintenance: the remaining manual `--repair` work now runs itself)
+- **Index orphans prune automatically (time-decayed candidacy).** The only fleet-wide operation a single plugin process could not safely do was pruning an index key whose gate lives in a project it cannot see. Now `expireAll` marks a key absent from every visible scope (own project + global) with `orphanCandidateSince`, clears it the moment any scope holds the gate again, and prunes only after `ORPHAN_CANDIDATE_DAYS` (7) of continuous absence — a live gate in another project clears its own candidacy on that project's sweep, so no cross-project evidence is lost in practice. `doctor --repair` remains the authoritative full-fleet sweep; the candidacy path removes the day-to-day need for it.
+- **Startup health event.** Init logs a `health` event to the project log when enforced gates are NOT TEACHING (`recurredAfterGate >= 3`) or review-flagged, instead of letting them accumulate silently.
+
+### Changed
+- **`git status` is a diagnostic** (joins `git show|log|ls-tree|ls-files|blame|diff`): read-only, its exit 1 is a downstream filter finding nothing, so it can never block and its exit 1 is immune. Existing blocking `git status` gates demote to reminding on repair.
+- **`DEMOTE_OVERRIDES` 5 → 3.** An agent that bypasses a gate 3 times is fighting it — demote sooner. Gates already past the bar demote on the next repair.
+
 ## 2.24.1 — 2026-09-05
 
 ### Readiness-poll hang: port hint + multi-line wait-loop detection

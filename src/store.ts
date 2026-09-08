@@ -5,7 +5,7 @@ import { canBlock, canRemind, fuzzySimilar, FUZZY_MAX_LEN, hasResidualIdentity, 
 import { coerceGateShape, repairGate } from "./validate"
 
 /** Bumped on behavior changes; stamped into init log events so stale sessions are visible. */
-export const PLUGIN_VERSION = "2.24.1"
+export const PLUGIN_VERSION = "2.25.0"
 
 export interface Gate {
   /** sha1 signature prefix — the pattern identity */
@@ -88,6 +88,8 @@ interface GatesFile {
 interface IndexEntry {
   projects: string[]
   lastSeen: string
+  /** set when no scope visible to the sweeper holds the gate; pruned if it stays absent past ORPHAN_CANDIDATE_DAYS */
+  orphanCandidateSince?: number
 }
 
 interface IndexFile {
@@ -106,6 +108,7 @@ export type LogEventType =
   | "recurred-after-gate"
   | "demoted"
   | "init"
+  | "health"
   | "repaired"
   | "quarantined"
   | "degraded"
@@ -180,11 +183,13 @@ export const MAX_GATES = 2000
 export const DEMOTE_RECURRENCES = 3
 /** enforcement feedback: this many explicit bypasses mean the agent considers
  * the gate friction — demote it regardless of recurrence */
-export const DEMOTE_OVERRIDES = 5
+export const DEMOTE_OVERRIDES = 3
 /** recurrence demotion additionally requires this many DISTINCT sessions that
  * reoffended after a reminder — one bad session (or one bad model in a shared
  * store) must not be able to demote a gate for everyone else */
 export const DEMOTE_REOFFENSE_SESSIONS = 2
+/** prune an index key absent from every scope visible to the sweeper after this many days (a live gate in an unopened project clears its own candidacy) */
+export const ORPHAN_CANDIDATE_DAYS = 7
 
 // --- Windows-safe fs helpers -------------------------------------------------
 
@@ -978,14 +983,38 @@ export class Stores {
         }
       })
     }
+    // Keys this process can see (own project + global). A key absent here may
+    // still live in another project's store — orphan pruning is therefore a
+    // time-decayed candidacy, not an immediate delete.
+    const visibleKeys = new Set<string>()
+    for (const store of this.scopes()) {
+      for (const gate of await store.load()) visibleKeys.add(gate.key)
+    }
     // The cross-project index rots on the same schedule as the gates.
     await this.globalStore.runLockedIndex(async () => {
       const index = await this.globalStore.loadIndex(true)
-      const cutoff = Date.now() - ttlDays * DAY_MS
+      const now = Date.now()
+      const cutoff = now - ttlDays * DAY_MS
       let changed = false
       for (const key of Object.keys(index.keys)) {
         const entry = index.keys[key]
-        if (entry && Date.parse(entry.lastSeen) < cutoff) {
+        if (!entry) continue
+        if (Date.parse(entry.lastSeen) < cutoff) {
+          delete index.keys[key]
+          changed = true
+          continue
+        }
+        if (visibleKeys.has(key)) {
+          if (entry.orphanCandidateSince !== undefined) {
+            delete entry.orphanCandidateSince
+            changed = true
+          }
+          continue
+        }
+        if (entry.orphanCandidateSince === undefined) {
+          entry.orphanCandidateSince = now
+          changed = true
+        } else if (now - entry.orphanCandidateSince > ORPHAN_CANDIDATE_DAYS * DAY_MS) {
           delete index.keys[key]
           changed = true
         }

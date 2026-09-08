@@ -2060,6 +2060,64 @@ check("longrun: dejavu:proceed bypasses the guard", (await lrAttempt("npm run de
 check("longrun: detached server is not interrupted", (await lrAttempt("npm run dev &")) === null)
 check("longrun: one-shot command is not interrupted", (await lrAttempt("npm run build")) === null)
 
+// --- 87. self-maintenance additions (2.25.0). Run before 86: 87b uses its own
+// DEJAVU_HOME, but the rest touch the shared global store that 86 corrupts. ---
+
+// 87a. git status is a read-only diagnostic: exit 1 is intended, never blocking
+check("git status is a diagnostic (exit 1 intended)", isIntendedNonzero("git status --short", 1))
+check("git status gate cannot block", !canBlock("bash", "bash:git status --short"))
+
+// 87b. index orphan candidacy: invisible keys get a candidacy timestamp, live
+// keys clear it, keys absent past the window are pruned.
+const orphGlobal = join(tmp, "orphan-global")
+const orphProj = join(tmp, "orphan-project")
+await mkdir(orphGlobal, { recursive: true })
+const orphNow = new Date().toISOString()
+const orphOldCandidacy = Date.now() - 8 * 24 * 60 * 60 * 1000
+const hasgateKey = patternKey("bash:some-existing-cmd")
+await writeFile(
+  join(orphGlobal, "index.json"),
+  JSON.stringify({
+    version: 1,
+    keys: {
+      orphanfresh: { projects: ["ghost"], lastSeen: orphNow },
+      orphanold: { projects: ["ghost"], lastSeen: orphNow, orphanCandidateSince: orphOldCandidacy },
+      [hasgateKey]: { projects: ["ghost"], lastSeen: orphNow, orphanCandidateSince: orphOldCandidacy },
+    },
+  }),
+  "utf8",
+)
+await writeFile(
+  join(orphGlobal, "gates.json"),
+  JSON.stringify({ version: 1, gates: [seedGate({ key: hasgateKey, signature: "bash:some-existing-cmd", status: "watching", count: 1, sessions: ["s"], lastSeen: orphNow })] }),
+  "utf8",
+)
+const prevHome = process.env.DEJAVU_HOME
+process.env.DEJAVU_HOME = orphGlobal
+await Dejavu({ directory: orphProj, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+process.env.DEJAVU_HOME = prevHome
+const orphIndex = JSON.parse(await readFile(join(orphGlobal, "index.json"), "utf8")) as { keys: Record<string, { orphanCandidateSince?: number }> }
+check("orphan candidacy set for a fresh invisible key", orphIndex.keys["orphanfresh"]?.orphanCandidateSince !== undefined)
+check("orphan candidacy prunes a key absent past the window", orphIndex.keys["orphanold"] === undefined)
+check("orphan candidacy cleared when a visible gate holds the key", orphIndex.keys[hasgateKey] !== undefined && orphIndex.keys[hasgateKey]?.orphanCandidateSince === undefined)
+
+// 87c. override demotion bar is 3: a blocking gate with 3 overrides demotes on repair
+const ov3Dir = join(tmp, "ov3-project")
+const OV3_CMD = "deploy --prod --force"
+const ov3Key = patternKey(callSignature("bash", { command: OV3_CMD }) ?? "")
+await seedGates(ov3Dir, [seedGate({ key: ov3Key, signature: `bash:${OV3_CMD}`, status: "blocking", overrideCount: 3 })])
+await Dejavu({ directory: ov3Dir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+const ov3Gate = (await readJson(join(ov3Dir, ".opencode", "dejavu", "gates.json"))).find((g) => g.key === ov3Key)
+check("3 overrides demote a blocking gate on repair", ov3Gate?.status === "watching" && ov3Gate?.feedbackDemoted === true)
+
+// 87d. startup logs a health event for NOT TEACHING gates
+const healthDir = join(tmp, "health-project")
+const HEALTH_CMD = "deploy --health-check"
+const healthKey = patternKey(callSignature("bash", { command: HEALTH_CMD }) ?? "")
+await seedGates(healthDir, [seedGate({ key: healthKey, signature: `bash:${HEALTH_CMD}`, status: "blocking", recurredAfterGate: 3 })])
+await Dejavu({ directory: healthDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+check("startup logs a health event for NOT TEACHING gates", (await readFile(join(healthDir, ".opencode", "dejavu", "log.jsonl"), "utf8")).includes('"health"'))
+
 // --- 86. round-8 invariant: a corrupt GLOBAL gates.json is quarantined under the
 // gates lock by reconcile(); the unlocked routing peeks in reconcileAll (escalation
 // filter + index rebuild) are non-force and never write. After init the store is
