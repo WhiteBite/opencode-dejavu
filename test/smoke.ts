@@ -2118,6 +2118,16 @@ await seedGates(healthDir, [seedGate({ key: healthKey, signature: `bash:${HEALTH
 await Dejavu({ directory: healthDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
 check("startup logs a health event for NOT TEACHING gates", (await readFile(join(healthDir, ".opencode", "dejavu", "log.jsonl"), "utf8")).includes('"health"'))
 
+// --- 88. correction quality: Unix-tool advice, success-shaped noise, AUTO_TEMPLATE re-derive ---
+check("suggestCorrection teaches PowerShell-native for legacy 'Check the spelling' head gates", suggestCorrection("bash:git log --oneline | head - <n>", "Check the spelling of the name, or if a path was included").includes("Unix tool"))
+check("suggestCorrection teaches PowerShell-native for pwsh 'not recognized' tail gates", suggestCorrection("bash:wc -l <str>", "wc : The term 'wc' is not recognized as the name of a cmdlet").includes("Unix tool"))
+check("detectFailure catches PowerShell not-recognized (cmdlet wording)", detectFailure("head : The term 'head' is not recognized as the name of a cmdlet, function, script file, or operable program.").matched)
+check("looksLikeSuccess rejects gradle task-summary noise", looksLikeSuccess("47 actionable tasks: 3 executed, 44 up-to-date"))
+check("looksLikeSuccess rejects the node version banner", looksLikeSuccess("Node.js v24.12.0"))
+const corrGate = seedGate({ key: patternKey("bash:git show --stat <hash> | head - <n>"), signature: "bash:git show --stat <hash> | head - <n>", status: "reminding", snippet: "Check the spelling of the name, or if a path was included", correction: `Last error: "Check the spelling of the name, or if a path was included" — address that specific error before retrying this exact call.` }) as unknown as Gate
+const corrChanged = repairGate(corrGate)
+check("repairGate upgrades a stale 'Check the spelling' AUTO_TEMPLATE to Unix advice", corrChanged === true && corrGate.correction?.includes("Unix tool") === true)
+
 // --- 86. round-8 invariant: a corrupt GLOBAL gates.json is quarantined under the
 // gates lock by reconcile(); the unlocked routing peeks in reconcileAll (escalation
 // filter + index rebuild) are non-force and never write. After init the store is

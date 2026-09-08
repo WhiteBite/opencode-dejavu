@@ -910,6 +910,11 @@ const SUCCESS_SHAPED: RegExp[] = [
   /\bTest Run Successful\b/i,
   /\bno offenses detected\b/i,
   /\b0 issues\b/i,
+  // gradle/node noise that is never failure evidence: task summary, config-cache
+  // note, node version banner (printed at the tail of a crash, it is not the cause).
+  /\b\d+\s+actionable tasks?\b/i,
+  /\bConfiguration cache entry\b/i,
+  /^Node\.js v\d+\./i,
 ]
 
 export function looksLikeSuccess(line: string): boolean {
@@ -1137,10 +1142,9 @@ export function suggestCorrection(signature: string, snippet: string): string {
   if (/\b(npm|yarn|pnpm|bun)\s+(install|ci)\b/i.test(signature)) {
     return "Dependency install failed — inspect the resolver error; try the lockfile/legacy-peer-deps route the repo documents."
   }
-  // Unix utilities that do not exist natively in PowerShell — a "not
-  // recognized" failure on one is a platform habit, teach the native form.
-  if (/\b(head|tail|wc|sed|awk|cut|sort|uniq|tr|xargs)\b/i.test(signature) && /not recognized|command not found/i.test(snippet)) {
-    return "This is a Unix command, not available in PowerShell — use the native equivalents: Select-Object -First/-Last for head/tail, (Get-Content <file>).Count for wc -l; or install the tool if you truly need it."
+  // Unix tools absent from PowerShell: a missing-command failure on one is a platform habit, teach the native form.
+  if (/\b(head|tail|cat|wc|grep|sed|awk|cut|sort|uniq|tr|xargs|less)\b/i.test(signature) && /not recognized|command not found|Check the spelling of the name/i.test(snippet)) {
+    return "Unix tool, not a PowerShell command — use the native equivalent: Select-Object -First/-Last for head/tail, Get-Content for cat, Select-String for grep, (Get-Content <file>).Count for wc -l."
   }
   // File-tool probes: not-found means a wrong path guess — locate the file
   // instead of retrying guessed path variants.

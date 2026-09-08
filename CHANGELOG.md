@@ -1,5 +1,17 @@
 # Changelog
 
+## 2.26.0 — 2026-09-08
+
+### Fixed (correction quality — what dejavu actually tells agents)
+A store audit of enforced gates surfaced three systemic advice defects; the two mechanical ones are fixed and propagate to existing gates via repair:
+
+- **Unix-tool-in-PowerShell advice.** A large share of recurring gates were `… | head`/`tail`/`cat`/`wc` failing because those are Unix tools, not PowerShell commands. The captured snippet was the PowerShell boilerplate tail (`Check the spelling of the name…`), which the Unix rule in `suggestCorrection` never matched (it looked for "not recognized"). The rule now also matches the boilerplate tail and covers `cat`/`grep`/`less`; the correction teaches the native equivalent (`Select-Object -First/-Last`, `Get-Content`, `Select-String`, `(Get-Content f).Count`). Existing gates are re-derived on repair (6 upgraded in the audit).
+- **Success/banner-shaped snippets are no longer stored as failure evidence** — gradle task summaries (`N actionable tasks: …`), `Configuration cache entry …`, and the `Node.js v<ver>` crash-tail banner join `looksLikeSuccess`, so they are cleared at the boundary instead of being quoted as the "error".
+- **`repairGate` re-derives machine-made (AUTO_TEMPLATE) corrections on every repair**, not just when the quote is success-shaped — `suggestCorrection` upgrades now reach old gates. Human/agent edits never match the template byte-for-byte and are untouched.
+
+### Known limitation (not mechanical)
+Gates whose only evidence is a bare `exit code N` (no error line captured) still get the generic correction — there is nothing to teach from. 28 such gates in the audit; improving this needs better snippet capture or a non-mechanical step.
+
 ## 2.25.0 — 2026-09-08
 
 ### Added (self-maintenance: the remaining manual `--repair` work now runs itself)

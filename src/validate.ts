@@ -140,17 +140,12 @@ export function repairGate(gate: Gate): boolean {
     gate.snippet = ""
     changed = true
   }
-  // Machine-generated template corrections quoting a success-shaped line teach
-  // garbage; re-derive from current evidence. Human edits never match the
-  // template byte-for-byte and are untouched.
-  if (gate.correction !== undefined) {
-    const quoted = AUTO_TEMPLATE_CORRECTION.exec(gate.correction)?.[1] ?? ""
-    if (looksLikeSuccess(quoted)) {
-      const rederived = suggestCorrection(gate.signature, gate.snippet)
-      if (rederived !== gate.correction) {
-        gate.correction = rederived
-        changed = true
-      }
+  // AUTO_TEMPLATE corrections are machine-made, so re-derive from current evidence on every repair: success-shaped quotes and stale platform advice reach old gates; human edits never match the template byte-for-byte and are untouched.
+  if (gate.correction !== undefined && AUTO_TEMPLATE_CORRECTION.test(gate.correction)) {
+    const rederived = suggestCorrection(gate.signature, gate.snippet)
+    if (rederived !== gate.correction) {
+      gate.correction = rederived
+      changed = true
     }
   }
   const signature = sanitizeForStore(gate.signature)
