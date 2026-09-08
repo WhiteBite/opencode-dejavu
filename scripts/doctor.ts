@@ -327,13 +327,12 @@ for (const scope of scopes) {
   // Gates that could never teach — enforced gates whose error recurs despite
   // enforcement. Relative to feedbackBaseline: a human re-enforcement gets a
   // fresh grace window, stale pre-demotion recurrences must not re-flag it.
-  // (Watching gates are excluded: feedback demotion already surrendered them;
-  // their history stays visible via the counters.)
+  // Flag only blocking gates: a recurring reminding/diagnostic gate is normal iteration (tests fail while the agent works); a recurring BLOCKING gate means the correction isn't working. Watching gates already surrendered to feedback demotion.
   const notTeaching = gates.filter(
     (g) =>
-      g.status !== "watching" &&
+      g.status === "blocking" &&
       g.recurredAfterGate - (g.feedbackBaseline?.recurred ?? 0) >= DEMOTE_RECURRENCES &&
-      (canBlock(g.tool, g.signature) || canRemind(g.tool, g.signature)),
+      canBlock(g.tool, g.signature),
   )
   if (notTeaching.length > 0) {
     issues += notTeaching.length

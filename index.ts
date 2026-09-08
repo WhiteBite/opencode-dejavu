@@ -365,6 +365,14 @@ export const Dejavu: Plugin = async ({ directory, client }) => {
           // remind is itself a concurrent first encounter and gets reminded too.
           const remindedAt = fresh.remindedSessions?.[session]
           if (remindedAt === undefined || Date.now() - remindedAt < REMINDER_RACE_WINDOW_MS) {
+            // heal-aware: recent consecutive successes mean the command is likely fixed — don't interrupt the run, but arm the chain so a repeat failure still blocks.
+            if (fresh.status === "blocking" && (fresh.succeededAfterGate ?? 0) > 0) {
+              if (fresh.remindedSessions === undefined) fresh.remindedSessions = {}
+              fresh.remindedSessions[session] = Date.now()
+              await target.store.save()
+              pendingLogs.push({ type: "retry-allowed", key: fresh.key, tool: fresh.tool, session, project: directory, via })
+              return
+            }
             if (fresh.remindedSessions === undefined) fresh.remindedSessions = {}
             fresh.remindedSessions[session] = Date.now()
             // Count only TRUE first encounters: raced calls (same dispatch

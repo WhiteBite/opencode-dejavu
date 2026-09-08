@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.27.0 — 2026-09-08
+
+### Changed (friction + signal-to-noise)
+- **Heal-aware blocking first encounter.** A blocking gate with recent consecutive successes (`succeededAfterGate > 0` — the command is being fixed) no longer aborts the first run of a session; it arms the remind→block chain silently and lets the call run. A success keeps healing; a repeat failure still blocks. This removes the last false-positive interrupt class (a stale blocking gate nagging a command that already works, e.g. the `cli start` case) without weakening blocking for commands that are genuinely still broken.
+- **Doctor NOT TEACHING now flags only blocking gates.** A recurring reminding/diagnostic gate (gradlew test, flutter test, vitest) is normal iteration — the failure IS the work — not a teaching failure; flagging it was noise. A recurring blocking gate is the real "correction isn't working" signal.
+
 ## 2.26.1 — 2026-09-08
 
 ### Fixed (snippet evidence for bare-exit failures)

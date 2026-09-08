@@ -1175,7 +1175,7 @@ await (hooksCH["tool.execute.after"] as AfterHook)(
 const chainGate = (await readJson(join(chainDir, ".opencode", "dejavu", "gates.json"))).find((g) => g.key === chainKey)
 check("success clears failedSessions for the session", chainGate?.failedSessions?.["ch-ses"] === undefined)
 check("success clears remindedSessions for the session", chainGate?.remindedSessions?.["ch-ses"] === undefined)
-check("session unblocked after proving the fix (remind, not block)", (await attemptWith(hooksCH)(CHAIN_CMD, "ch-ses", "ch5"))?.message.includes("[dejavu] REMINDER") === true)
+check("session unblocked after proving the fix (heal-aware: runs free, no reminder)", (await attemptWith(hooksCH)(CHAIN_CMD, "ch-ses", "ch5")) === null)
 
 // --- 56. iteration runners remind but never block ---
 const iterDir = join(tmp, "iteration-project")
@@ -2129,6 +2129,20 @@ const corrChanged = repairGate(corrGate)
 check("repairGate upgrades a stale 'Check the spelling' AUTO_TEMPLATE to Unix advice", corrChanged === true && corrGate.correction?.includes("Unix tool") === true)
 check("failureSnippet falls back to the last non-success line, not a bare exit code", failureSnippet("Loading project\nConfiguration cache entry stored.", 1) === "Loading project")
 check("failureSnippet still never surfaces a success-only tail", failureSnippet("17 passed\nall tests passed", 1) === "exit code 1")
+
+// --- 89. heal-aware blocking first encounter (2.27.0): a gate with recent
+// successes does not abort the first run, but the chain stays armed. ---
+const healAwareDir = join(tmp, "heal-aware-project")
+const HA_CMD = "deploy --prod --force"
+const haKey = patternKey(callSignature("bash", { command: HA_CMD }) ?? "")
+await seedGates(healAwareDir, [seedGate({ key: haKey, signature: `bash:${HA_CMD}`, status: "blocking", succeededAfterGate: 2 })])
+const hooksHA = await Dejavu({ directory: healAwareDir, client: { app: { log: async () => ({}) } } } as unknown as Ctx)
+check("heal-aware: healing blocking gate does not abort the first encounter", (await attemptWith(hooksHA)(HA_CMD, "ha1", "ha1")) === null)
+const haGate = (await readJson(join(healAwareDir, ".opencode", "dejavu", "gates.json"))).find((g) => g.key === haKey)
+check("heal-aware: the chain stays armed (remindedSessions set)", haGate?.remindedSessions?.["ha1"] !== undefined)
+check("heal-aware: no reminder counted (nothing was shown)", (haGate?.remindedCount ?? 0) === 0)
+await failOn(hooksHA)(HA_CMD, "ha1", "ha2")
+check("heal-aware: a repeat failure after the armed run still blocks", (await attemptWith(hooksHA)(HA_CMD, "ha1", "ha3"))?.message.includes("[dejavu] BLOCKED") === true)
 
 // --- 86. round-8 invariant: a corrupt GLOBAL gates.json is quarantined under the
 // gates lock by reconcile(); the unlocked routing peeks in reconcileAll (escalation
